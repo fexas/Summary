@@ -1,0 +1,2 @@
+Experiment_Index,train_time,refined_time,mmd_nn,mmd_nn_r,accp_rate
+1,00:00:06,00:01:49,0.3782208,0.33185494,1.5e-05

@@ -1,0 +1,16 @@
+numpy
+scipy
+pandas
+matplotlib
+seaborn
+tqdm
+jupyter
+bayesflow
+sbi
+pyabc
+POT
+arviz
+keras>=3.0
+torch
+torchvision
+torchaudio

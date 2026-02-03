@@ -1,0 +1,186 @@
+\begin{thebibliography}{10}
+
+\bibitem{Tavare97}
+S.~Tavar{\'e}, D.~J. Balding, R.~C. Griffiths, and P.~Donnelly,
+\newblock ``Inferring coalescence times from dna sequence data,''
+\newblock {\em Genetics}, vol. 145, no. 2, pp. 505--518, 1997.
+
+\bibitem{Beaumont2002}
+M.~A. Beaumont, W.~Zhang, and D.~J. Balding,
+\newblock ``Approximate bayesian computation in population genetics,''
+\newblock {\em Genetics}, vol. 162, no. 4, pp. 2025--2035, 2002.
+
+\bibitem{Peters2006}
+G.~Peters and S.~Sisson,
+\newblock ``Bayesian inference, monte carlo sampling and operational risk,''
+\newblock {\em Journal of Operational Risk}, vol. 1, 09 2006.
+
+\bibitem{Tanaka2006}
+M.~Tanaka, A.~Francis, F.~Luciani, and S.~Sisson,
+\newblock ``Using approximate bayesian computation to estimate tuberculosis
+  transmission parameters from genotype data,''
+\newblock {\em Genetics}, vol. 173, pp. 1511--20, 08 2006.
+
+\bibitem{Wood2010}
+{S. N.} Wood,
+\newblock ``Statistical inference for noisy nonlinear ecological dynamic
+  systems,''
+\newblock {\em Nature}, vol. 466, no. 7310, pp. 1102--1104, 8 2010.
+
+\bibitem{Fearnhead2012}
+P.~Fearnhead and D.~Prangle,
+\newblock ``Constructing summary statistics for approximate bayesian
+  computation: semi-automatic approximate bayesian computation,''
+\newblock {\em Journal of the Royal Statistical Society: Series B (Statistical
+  Methodology)}, vol. 74, no. 3, pp. 419--474, 2012.
+
+\bibitem{Jiang18}
+B.~Jiang, T.-Y. Wu, and W.-H. Wong,
+\newblock ``Approximate bayesian computation with kullback-leibler divergence
+  as data discrepancy,''
+\newblock in {\em Proceedings of the Twenty-First International Conference on
+  Artificial Intelligence and Statistics}, Amos Storkey and Fernando
+  Perez-Cruz, Eds., Playa Blanca, Lanzarote, Canary Islands, 09--11 Apr 2018,
+  vol.~84 of {\em Proceedings of Machine Learning Research}, pp. 1711--1721,
+  PMLR.
+
+\bibitem{Park16}
+M.~Park, W.~Jitkrittum, and D.~Sejdinovic,
+\newblock ``K2-abc: Approximate bayesian computation with kernel embeddings,''
+\newblock in {\em Proceedings of the 19th International Conference on
+  Artificial Intelligence and Statistics}, Arthur Gretton and Christian~C.
+  Robert, Eds., Cadiz, Spain, 09--11 May 2016, vol.~51 of {\em Proceedings of
+  Machine Learning Research}, pp. 398--407, PMLR.
+
+\bibitem{Bernton2019}
+E.~Bernton, P.~E. Jacob, M.~Gerber, and C.~P. Robert,
+\newblock ``Approximate bayesian computation with the wasserstein distance,''
+\newblock {\em Journal of the Royal Statistical Society: Series B (Statistical
+  Methodology)}, vol. 81, no. 2, pp. 235--269, 2019.
+
+\bibitem{Weed2019}
+J.~Weed and F.~Bach,
+\newblock ``Sharp asymptotic and finite-sample rates of convergence of
+  empirical measures in wasserstein distance,''
+\newblock {\em Bernoulli}, vol. 25, no. 4A, pp. 2620--2648, 11 2019.
+
+\bibitem{rabin:et:al:2011}
+J.~Rabin, G.~Peyr{\'e}, J.~Delon, and M.~Bernot,
+\newblock ``Wasserstein barycenter and its application to texture mixing,''
+\newblock in {\em Scale Space and Variational Methods in Computer Vision},
+  Berlin, Heidelberg, 2012, pp. 435--446, Springer Berlin Heidelberg.
+
+\bibitem{bonneel2015sliced}
+N.~Bonneel, J.~Rabin, G.~Peyr{\'e}, and H.~Pfister,
+\newblock ``Sliced and {R}adon {W}asserstein barycenters of measures,''
+\newblock {\em Journal of Mathematical Imaging and Vision}, vol. 51, no. 1, pp.
+  22--45, 2015.
+
+\bibitem{Deshpande2018}
+I.~Deshpande, Z.~Zhang, and A.~G. Schwing,
+\newblock ``Generative modeling using the sliced {W}asserstein distance,''
+\newblock in {\em IEEE Conference on Computer Vision and Pattern Recognition},
+  2018, pp. 3483--3491.
+
+\bibitem{csimcsekli2018sliced}
+A.~Liutkus, U.~{\c{S}}im{\c{s}}ekli, S.~Majewski, A.~Durmus, and F.-R. Stoter,
+\newblock ``Sliced-{W}asserstein flows: Nonparametric generative modeling via
+  optimal transport and diffusions,''
+\newblock in {\em International Conference on Machine Learning}, 2019.
+
+\bibitem{Kolouri2019Sliced}
+S.~Kolouri, P.~E. Pope, C.~E. Martin, and G.~K. Rohde,
+\newblock ``Sliced {W}asserstein auto-encoders,''
+\newblock in {\em International Conference on Learning Representations}, 2019.
+
+\bibitem{Bonnotte2013}
+N.~Bonnotte,
+\newblock {\em Unidimensional and Evolution Methods for Optimal
+  Transportation},
+\newblock Ph.D. thesis, Paris 11, 2013.
+
+\bibitem{deshpande2019max}
+I.~Deshpande, Y.-T. Hu, R.~Sun, A.~Pyrros, N.~Siddiqui, S.~Koyejo, Z.~Zhao,
+  D.~Forsyth, and A.~Schwing,
+\newblock ``Max-{S}liced {W}asserstein distance and its use for {GAN}s,''
+\newblock in {\em IEEE Conference on Computer Vision and Pattern Recognition},
+  2019.
+
+\bibitem{2019arXiv190604516N}
+K.~{Nadjahi}, A.~{Durmus}, U.~{{\c{S}}im{\textcommabelow s}ekli}, and
+  R.~{Badeau},
+\newblock ``{Asymptotic Guarantees for Learning Generative Models with the
+  Sliced-Wasserstein Distance},''
+\newblock in {\em Advances in Neural Information Processing Systems}, 2019.
+
+\bibitem{Sisson2018}
+S.~A. {Sisson}, Y.~{Fan}, and M.~A. {Beaumont},
+\newblock ``{Overview of Approximate Bayesian Computation},''
+\newblock {\em arXiv e-prints}, p. arXiv:1802.09720, Feb 2018.
+
+\bibitem{Frazier2018}
+D.~T. Frazier, G.~M. Martin, C.P. Robert, and J.~Rousseau,
+\newblock ``{Asymptotic properties of approximate Bayesian computation},''
+\newblock {\em Biometrika}, vol. 105, no. 3, pp. 593--607, 06 2018.
+
+\bibitem{peyre2019computational}
+G.~Peyr{\'e}, M.~Cuturi, et~al.,
+\newblock ``Computational optimal transport,''
+\newblock {\em Foundations and Trends{\textregistered} in Machine Learning},
+  vol. 11, no. 5-6, pp. 355--607, 2019.
+
+\bibitem{rachev:ruschendorf:1998}
+S.~T. Rachev and L.~R\"{u}schendorf,
+\newblock {\em Mass transportation problems. {V}ol. {I}},
+\newblock Probability and its Applications (New York). Springer-Verlag, New
+  York, 1998,
+\newblock Theory.
+
+\bibitem{Villani2008}
+C.~Villani,
+\newblock {\em {Optimal Transport: Old and New}},
+\newblock Grundlehren der mathematischen Wissenschaften. Springer, 2009
+  edition, Sept. 2008.
+
+\bibitem{Toni2009}
+T.~Toni, D.~Welch, N.~Strelkowa, A.~Ipsen, and M.~Stumpf,
+\newblock ``Approximate bayesian computation scheme for parameter inference and
+  model selection in dynamical systems,''
+\newblock {\em Journal of the Royal Society, Interface / the Royal Society},
+  vol. 6, pp. 187--202, 03 2009.
+
+\bibitem{Klinger2018}
+E.~Klinger, D.~Rickert, and J.~Hasenauer,
+\newblock ``{pyABC: distributed, likelihood-free inference},''
+\newblock {\em Bioinformatics}, vol. 34, no. 20, pp. 3591--3593, 05 2018.
+
+\bibitem{swabc_code}
+K.~Nadjahi, V.~De~Bortoli, A.~Durmus, R.~Badeau, and U.~\c{S}im\c{s}ekli,
+\newblock ``Sw-abc software implementation,''
+  \url{https://github.com/kimiandj/slicedwass_abc},
+  \url{https://vdeborto.github.io/publication/sw_abc}.
+
+\bibitem{buades2005non}
+A.~Buades, B.~Coll, and J.-M. Morel,
+\newblock ``A non-local algorithm for image denoising,''
+\newblock in {\em 2005 IEEE Computer Society Conference on Computer Vision and
+  Pattern Recognition (CVPR'05)}. IEEE, 2005, vol.~2, pp. 60--65.
+
+\bibitem{fan2019brief}
+L.~Fan, F.~Zhang, H.~Fan, and C.~Zhang,
+\newblock ``Brief review of image denoising techniques,''
+\newblock {\em Visual Computing for Industry, Biomedicine, and Art}, vol. 2,
+  no. 1, pp. 7, 2019.
+
+\bibitem{martin2001database}
+D.~Martin, C.~Fowlkes, D.~Tal, J.~Malik, et~al.,
+\newblock ``A database of human segmented natural images and its application to
+  evaluating segmentation algorithms and measuring ecological statistics,''
+\newblock Iccv Vancouver:, 2001.
+
+\bibitem{Kolouri2019GSW}
+S.~{Kolouri}, K.~{Nadjahi}, U.~{Simsekli}, R.~{Badeau}, and G.~K. {Rohde},
+\newblock ``{Generalized Sliced Wasserstein Distances},''
+\newblock in {\em Advances in Neural Information Processing Systems}, 2019.
+
+\end{thebibliography}

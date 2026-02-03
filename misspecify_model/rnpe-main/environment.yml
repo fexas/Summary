@@ -1,0 +1,16 @@
+name: rnpe_env
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip
+  - numpy
+  - matplotlib
+  - ipykernel
+  - numpyro
+  - jupyterlab
+  - numba
+  - pip:
+    - flowjax=5
+    - sbibm
