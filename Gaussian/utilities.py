@@ -1,172 +1,44 @@
-
 import torch
 import numpy as np
 import time
 
-def compute_bandwidth_torch(model, x_obs, task, n_samples=5000, quantile_level=0.005, device="cpu"):
-    """
-    Compute bandwidth for likelihood estimation using quantiles of distance.
-    """
-    print("Computing bandwidth for refinement...")
-    # model.eval() # Assumed to be in eval mode or handled by wrapper
-    
-    # 1. Generate Theta0 from learned model
-    # x_obs: (n, d_x)
-    x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device) # (1, n, d_x)
-    
-    # Replicate x_obs for batch generation
-    x_obs_batch = x_obs_tensor.expand(n_samples, -1, -1) # (N0, n, d_x)
-    
-    # Use model.sample_posterior to be generic
-    # If model doesn't have sample_posterior, try legacy G(z, stats) approach
-    if hasattr(model, "sample_posterior"):
-        # Expecting sample_posterior to handle stats computation internally if needed
-        # Or we pass stats? SMMD needs stats. BayesFlow needs conditions.
-        # Let's assume wrapper handles (x_obs)
-        # Wait, x_obs_batch is (N0, n, d_x).
-        # Wrapper should handle this.
-        # But wait, SMMD sample_posterior might need Z?
-        # Let's define a standard interface: model.sample_posterior(x_obs, n_samples)
-        Theta0_np = model.sample_posterior(x_obs, n_samples) # Returns numpy (n_samples, d)
-    else:
-        # Legacy SMMD support (if not wrapped)
-        with torch.no_grad():
-            stats = model.T(x_obs_batch) # (N0, p)
-            Z = torch.randn(n_samples, 1, task.d, device=device) # Assuming task.d exists
-            Theta0 = model.G(Z, stats).squeeze(1) # (N0, d)
-        Theta0_np = Theta0.cpu().numpy()
-    
-    # 2. Simulate Data from Theta0
-    # Use GaussianTask simulator (batch)
-    # Output: (N0, n, d_x)
-    xn_0 = task.simulator(Theta0_np, n_samples=task.n) 
-    xn_0_tensor = torch.from_numpy(xn_0).float().to(device)
-    
-    # 3. Compute Stats and Distance
-    with torch.no_grad():
-        # Generic model.compute_stats or model.T
-        if hasattr(model, "compute_stats"):
-             TT = model.compute_stats(xn_0_tensor)
-             T_target = model.compute_stats(x_obs_tensor)
-        else:
-             TT = model.T(xn_0_tensor) # (N0, p)
-             T_target = model.T(x_obs_tensor) # (1, p)
-        
-        # Distance (Euclidean)
-        diff = T_target - TT
-        dist_sq = torch.sum(diff**2, dim=1) # (N0,)
-        dist = torch.sqrt(dist_sq)
-        
-    dist_np = dist.cpu().numpy()
-    
-    # 4. Quantile
-    quan1 = np.quantile(dist_np, quantile_level)
-    
-    print(f"Computed bandwidth (epsilon): {quan1}")
-    return quan1
+# =============================================================================
+# Shared Helpers
+# =============================================================================
 
-def approximate_likelihood_torch(model, theta, x_obs_stats, task, nsims, epsilon, device="cpu"):
+def run_mcmc_refinement(current_theta, x_obs_stats, task, 
+                       log_prior_fn, likelihood_fn, 
+                       n_chains, n_samples, burn_in, thin, 
+                       proposal_std=0.5):
     """
-    Compute KDE-based likelihood for a batch of parameters.
-    theta: (batch, d) numpy
-    x_obs_stats: (1, p) torch tensor
-    Returns: (batch,) numpy
+    Generic MCMC refinement loop.
+    
+    Args:
+        current_theta: (n_chains, d) Initial samples.
+        x_obs_stats: (1, p) Target summary statistics.
+        task: GaussianTask instance.
+        log_prior_fn: Function (theta) -> log_prob
+        likelihood_fn: Function (theta, x_obs_stats) -> likelihood (numpy array)
+        ...
     """
-    batch_size = theta.shape[0]
-    
-    # 1. Simulate: (batch * nsims, n, d_x)
-    theta_exp = np.repeat(theta, nsims, axis=0)
-    
-    sim_data = task.simulator(theta_exp, n_samples=task.n)
-    sim_data_tensor = torch.from_numpy(sim_data).float().to(device)
-    
-    # 2. Compute Stats: (B*nsims, p)
-    with torch.no_grad():
-        if hasattr(model, "compute_stats"):
-            sim_stats = model.compute_stats(sim_data_tensor)
-        else:
-            sim_stats = model.T(sim_data_tensor)
-        
-    # 3. Reshape and Compute Distance
-    # (B, nsims, p)
-    sim_stats = sim_stats.view(batch_size, nsims, -1)
-    
-    # x_obs_stats: (1, p) -> (1, 1, p)
-    target = x_obs_stats.unsqueeze(0)
-    
-    # Dist sq: (B, nsims)
-    diff = sim_stats - target
-    dist_sq = torch.sum(diff**2, dim=-1)
-    
-    # 4. KDE
-    # kernel = exp(-dist_sq / (2 * epsilon^2))
-    kernel = torch.exp(-dist_sq / (2 * epsilon**2))
-    likelihood = torch.mean(kernel, dim=1) # (B,)
-    
-    return likelihood.cpu().numpy()
-
-def refine_posterior(model, x_obs, task, 
-                     n_chains=1000, n_samples=1, burn_in=99, 
-                     thin=1, nsims=50, epsilon=None, proposal_std=0.5, device="cpu"):
-    """
-    Run Parallel MCMC Refinement.
-    """
-    print(f"Starting MCMC Refinement (chains={n_chains}, burn_in={burn_in}, samples={n_samples})...")
-    # model.eval()
-    
-    # 1. Compute Bandwidth if not provided
-    if epsilon is None:
-        epsilon = compute_bandwidth_torch(model, x_obs, task, device=device)
-        
-    # 2. Initialize Chains from Model Posterior
-    x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
-    
-    # Compute stats for x_obs once
-    with torch.no_grad():
-        if hasattr(model, "compute_stats"):
-            x_obs_stats = model.compute_stats(x_obs_tensor)
-        else:
-            x_obs_stats = model.T(x_obs_tensor)
-    
-    # Sample Initial Points
-    if hasattr(model, "sample_posterior"):
-        # Should return (n_chains, d)
-        current_theta = model.sample_posterior(x_obs, n_chains)
-    else:
-        with torch.no_grad():
-            Z = torch.randn(n_chains, 1, task.d, device=device)
-            current_theta = model.G(Z, x_obs_stats.expand(n_chains, -1)).squeeze(1).cpu().numpy()
-            
     # Clip to bounds initially
     current_theta = np.clip(current_theta, task.lower, task.upper)
     
-    # 3. Dimensional-wise Proposal Step Size
-    # Calculate std per dimension from initial samples
+    # Dimensional-wise Proposal Step Size
     std_per_dim = np.std(current_theta, axis=0)
-    # Avoid zero std
     std_per_dim = np.maximum(std_per_dim, 1e-6)
-    
-    # Use proposal_std as a scaling factor
     proposal_scale = std_per_dim * proposal_std
     print(f"Proposal Scale (per dim): {proposal_scale}")
     
-    # 4. Initial Log Probabilities
-    # Prior
-    current_log_prior = task.log_prior(current_theta) # (chains,)
-    
-    # Likelihood
-    current_likelihood = approximate_likelihood_torch(model, current_theta, x_obs_stats, task, nsims, epsilon, device=device)
-    
-    # Current Ratio (Prior * Likelihood)
+    # Initial Log Probabilities
+    current_log_prior = log_prior_fn(current_theta)
+    current_likelihood = likelihood_fn(current_theta, x_obs_stats)
     current_prob = np.exp(current_log_prior) * current_likelihood
     
-    # Storage
     samples = []
     total_accepted = 0
-    
     start_time = time.time()
     
-    # MCMC Loop
     total_sampling_steps = n_samples * thin
     total_steps = burn_in + total_sampling_steps
     
@@ -178,9 +50,8 @@ def refine_posterior(model, x_obs, task,
         proposed_theta = current_theta + proposal_noise
         
         # Proposed Log Prob
-        proposed_log_prior = task.log_prior(proposed_theta)
-        
-        proposed_likelihood = approximate_likelihood_torch(model, proposed_theta, x_obs_stats, task, nsims, epsilon, device=device)
+        proposed_log_prior = log_prior_fn(proposed_theta)
+        proposed_likelihood = likelihood_fn(proposed_theta, x_obs_stats)
         proposed_prob = np.exp(proposed_log_prior) * proposed_likelihood
         
         # Acceptance Probability
@@ -197,23 +68,185 @@ def refine_posterior(model, x_obs, task,
         
         if step > burn_in:
             total_accepted += np.sum(accept_mask)
-            
-            # Check if we should collect sample
-            sampling_step = step - burn_in
-            if sampling_step % thin == 0:
+            if (step - burn_in) % thin == 0:
                 samples.append(current_theta.copy())
                 
         if step % 10 == 0 or step == total_steps:
             elapsed = time.time() - start_time
             print(f"Step {step}/{total_steps} | Accepted: {np.mean(accept_mask):.2%} | Time: {elapsed:.2f}s")
             
-    # Collect Samples
     if not samples:
         samples.append(current_theta.copy())
         
     posterior_samples = np.vstack(samples)
-    
     acceptance_rate = total_accepted / (n_chains * total_sampling_steps) if total_sampling_steps > 0 else 0
     print(f"Refinement Complete. Acceptance Rate: {acceptance_rate:.2%}")
     
     return posterior_samples
+
+def compute_bandwidth_core(theta0_np, x_obs_tensor, task, stats_fn, n_samples, quantile_level, device):
+    """
+    Core bandwidth computation logic.
+    """
+    # Simulate Data from Theta0
+    xn_0 = task.simulator(theta0_np, n_samples=task.n) 
+    xn_0_tensor = torch.from_numpy(xn_0).float().to(device)
+    
+    with torch.no_grad():
+        TT = stats_fn(xn_0_tensor)
+        T_target = stats_fn(x_obs_tensor)
+        
+        diff = T_target - TT
+        dist_sq = torch.sum(diff**2, dim=1)
+        dist = torch.sqrt(dist_sq)
+        
+    dist_np = dist.cpu().numpy()
+    quan1 = np.quantile(dist_np, quantile_level)
+    print(f"Computed bandwidth (epsilon): {quan1}")
+    return quan1
+
+def approximate_likelihood_core(theta, x_obs_stats, task, stats_fn, nsims, epsilon, device):
+    """
+    Core approximate likelihood computation.
+    """
+    batch_size = theta.shape[0]
+    theta_exp = np.repeat(theta, nsims, axis=0)
+    sim_data = task.simulator(theta_exp, n_samples=task.n)
+    sim_data_tensor = torch.from_numpy(sim_data).float().to(device)
+    
+    with torch.no_grad():
+        sim_stats = stats_fn(sim_data_tensor)
+        
+    sim_stats = sim_stats.view(batch_size, nsims, -1)
+    target = x_obs_stats.unsqueeze(0)
+    
+    diff = sim_stats - target
+    dist_sq = torch.sum(diff**2, dim=-1)
+    
+    kernel = torch.exp(-dist_sq / (2 * epsilon**2))
+    likelihood = torch.mean(kernel, dim=1)
+    
+    return likelihood.cpu().numpy()
+
+# =============================================================================
+# SMMD/MMD Implementation
+# =============================================================================
+
+def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.005, device="cpu"):
+    print("Computing bandwidth for SMMD refinement...")
+    x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
+    x_obs_batch = x_obs_tensor.expand(n_samples, -1, -1)
+    
+    with torch.no_grad():
+        stats = model.T(x_obs_batch)
+        Z = torch.randn(n_samples, 1, task.d, device=device)
+        Theta0 = model.G(Z, stats).squeeze(1)
+    Theta0_np = Theta0.cpu().numpy()
+    
+    return compute_bandwidth_core(Theta0_np, x_obs_tensor, task, model.T, n_samples, quantile_level, device)
+
+def refine_posterior_smmd(model, x_obs, task, 
+                         n_chains=1000, n_samples=1, burn_in=99, 
+                         thin=1, nsims=50, epsilon=None, proposal_std=0.5, device="cpu"):
+    print(f"Starting SMMD MCMC Refinement...")
+    
+    if epsilon is None:
+        epsilon = compute_bandwidth_smmd(model, x_obs, task, device=device)
+        
+    x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
+    
+    # 1. Stats and Initial Samples
+    with torch.no_grad():
+        x_obs_stats = model.T(x_obs_tensor)
+        # Initial samples
+        Z = torch.randn(n_chains, 1, task.d, device=device)
+        current_theta = model.G(Z, x_obs_stats.expand(n_chains, -1)).squeeze(1).cpu().numpy()
+        
+    # 2. Define Likelihood Function
+    def likelihood_fn(theta, target_stats):
+        return approximate_likelihood_core(theta, target_stats, task, model.T, nsims, epsilon, device)
+        
+    # 3. Run MCMC
+    return run_mcmc_refinement(current_theta, x_obs_stats, task, 
+                              task.log_prior, likelihood_fn, 
+                              n_chains, n_samples, burn_in, thin, proposal_std)
+
+# =============================================================================
+# BayesFlow Implementation
+# =============================================================================
+
+def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_level=0.005, device="cpu"):
+    print("Computing bandwidth for BayesFlow refinement...")
+    x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
+    
+    # Sample from BayesFlow model
+    # model.sample(conditions=...) returns (n_samples, batch, d) or (batch, n_samples, d)
+    # x_obs_tensor is (1, n, d_x)
+    # We want n_samples
+    
+    # Check if we need to wrap conditions in dict (depends on BF version/config)
+    # Assuming ContinuousApproximator with default inputs
+    conditions = {"summary_conditions": x_obs_tensor} # Legacy or specific config
+    # OR direct tensor if summary network expects it. 
+    # Let's try direct tensor as `summary_variables` or `conditions`.
+    # Based on previous error log: `inference_network.log_prob` took `conditions`.
+    # `ContinuousApproximator.sample` signature: (num_samples, batch_size, ...)
+    
+    # Let's use the standard `sample` method
+    # It usually handles dict wrapping if adapter is used.
+    # If we pass tensor, it might need to be named.
+    # However, model.sample(conditions=x_obs_tensor, num_samples=n_samples) usually works if no adapter or simple adapter.
+    
+    # Update for Keras 3 with explicit adapter (requires dict)
+    conditions_dict = {"summary_variables": x_obs_tensor}
+    Theta0_np = model.sample(conditions=conditions_dict, num_samples=n_samples)
+    
+    # Theta0_np shape: (1, n_samples, d) (since batch_size=1)
+    Theta0_np = Theta0_np.reshape(n_samples, -1)
+    if isinstance(Theta0_np, torch.Tensor):
+        Theta0_np = Theta0_np.cpu().numpy()
+        
+    return compute_bandwidth_core(Theta0_np, x_obs_tensor, task, model.summary_network, n_samples, quantile_level, device)
+
+def refine_posterior_bayesflow(model, x_obs, task, 
+                              n_chains=1000, n_samples=1, burn_in=99, 
+                              thin=1, nsims=50, epsilon=None, proposal_std=0.5, device="cpu"):
+    print(f"Starting BayesFlow MCMC Refinement...")
+    
+    if epsilon is None:
+        epsilon = compute_bandwidth_bayesflow(model, x_obs, task, device=device)
+        
+    x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
+    
+    # 1. Stats and Initial Samples
+    with torch.no_grad():
+        x_obs_stats = model.summary_network(x_obs_tensor)
+        
+        # Initial samples
+        conditions_dict = {"summary_variables": x_obs_tensor}
+        current_theta = model.sample(conditions=conditions_dict, num_samples=n_chains)
+        current_theta = current_theta.reshape(n_chains, -1)
+        if isinstance(current_theta, torch.Tensor):
+            current_theta = current_theta.cpu().numpy()
+            
+    # 2. Define Likelihood Function
+    def likelihood_fn(theta, target_stats):
+        return approximate_likelihood_core(theta, target_stats, task, model.summary_network, nsims, epsilon, device)
+        
+    # 3. Run MCMC
+    return run_mcmc_refinement(current_theta, x_obs_stats, task, 
+                              task.log_prior, likelihood_fn, 
+                              n_chains, n_samples, burn_in, thin, proposal_std)
+
+# Backwards compatibility / Dispatcher (optional)
+def refine_posterior(model, *args, **kwargs):
+    if hasattr(model, "summary_network"):
+        return refine_posterior_bayesflow(model, *args, **kwargs)
+    else:
+        return refine_posterior_smmd(model, *args, **kwargs)
+
+def compute_bandwidth_torch(model, *args, **kwargs):
+    if hasattr(model, "summary_network"):
+        return compute_bandwidth_bayesflow(model, *args, **kwargs)
+    else:
+        return compute_bandwidth_smmd(model, *args, **kwargs)

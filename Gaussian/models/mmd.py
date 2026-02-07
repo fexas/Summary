@@ -1,7 +1,7 @@
 
 import torch
 import torch.nn as nn
-from Gaussian.models.smmd import SMMD_Model
+from models.smmd import SMMD_Model
 
 def mmd_loss(theta_true, theta_fake, n_points=50):
     """

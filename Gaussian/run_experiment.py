@@ -12,6 +12,9 @@ from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
+# ensure the backend is set
+if "KERAS_BACKEND" not in os.environ:
+    os.environ["KERAS_BACKEND"] = "torch"
 
 # Import from local modules
 from data_generation import (
@@ -22,13 +25,13 @@ from data_generation import (
 )
 from models.smmd import SMMD_Model, sliced_mmd_loss
 from models.mmd import MMD_Model, mmd_loss
+from models.bayesflow_net import build_bayesflow_model
 from utilities import refine_posterior, compute_bandwidth_torch
 from pymc_sampler import run_pymc
 
 # Try importing BayesFlow (optional)
 try:
     import bayesflow as bf
-    from models.bayesflow_wrapper import BayesFlowWrapper
     BAYESFLOW_AVAILABLE = True
 except ImportError:
     BAYESFLOW_AVAILABLE = False
@@ -43,7 +46,7 @@ L = 20      # Slicing directions (for SMMD)
 BATCH_SIZE = 256
 EPOCHS = 500
 LEARNING_RATE = 0.001
-DATASET_SIZE = 12800
+DATASET_SIZE = 25600
 
 # Check for MPS (Apple Silicon)
 if torch.backends.mps.is_available():
@@ -107,75 +110,82 @@ def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd"):
         avg_loss = epoch_loss / len(train_loader)
         loss_history.append(avg_loss)
         
-        if (epoch + 1) % 50 == 0:
+        if (epoch + 1) % 10 == 0:
             print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
             
     print(f"Training finished in {time.time() - start_time:.2f}s")
     return loss_history
 
 def train_bayesflow(train_loader, epochs, device):
-    """Training loop for BayesFlow."""
+    """Training loop for BayesFlow using native PyTorch backend."""
     if not BAYESFLOW_AVAILABLE:
         raise ImportError("BayesFlow is not available.")
         
-    # Define BayesFlow components
-    # 1. Summary Network (same architecture as SMMD if possible, or standard)
-    summary_net = bf.networks.DeepSet(summary_dim=10) # Using built-in DeepSet for simplicity or define custom
+    # Build model using factory function
+    amortized_posterior = build_bayesflow_model(d=d, d_x=d_x, summary_dim=10)
     
-    # 2. Inference Network (Invertible Network)
-    inference_net = bf.networks.InferenceNetwork(num_params=d)
-    
-    # 3. Amortized Posterior
-    amortized_posterior = bf.amortizers.AmortizedPosterior(inference_net, summary_net)
-    
-    # 4. Trainer
-    # We need to adapt the data loader or use BayesFlow's trainer
-    # BayesFlow trainer expects a generative model or a data loader with dicts
-    
-    # Let's manually train for flexibility with existing dataloader
+    # Use native PyTorch Optimizer
+    # Note: Keras 3 models (with torch backend) wrap torch.nn.Module, so .parameters() works
     optimizer = optim.Adam(amortized_posterior.parameters(), lr=LEARNING_RATE)
     scheduler = get_scheduler(optimizer, epochs)
     
+    # Move model to device
     amortized_posterior.to(device)
+    
     loss_history = []
     
-    print("Starting training (BayesFlow)...")
+    print("Starting training (BayesFlow with PyTorch Loop)...")
     start_time = time.time()
     
-    for epoch in range(epochs):
-        epoch_loss = 0.0
-        for x_batch, theta_batch in train_loader:
-            x_batch = x_batch.to(device)
-            theta_batch = theta_batch.to(device)
+    # Manual build (one forward pass) to initialize weights
+    # This is often needed for Keras models to build layers
+    try:
+        first_x, first_theta = next(iter(train_loader))
+        dummy_dict = {
+            "inference_variables": first_theta.to(device).float(),
+            "summary_variables": first_x.to(device).float()
+        }
+        # Run one forward pass
+        amortized_posterior(dummy_dict)
+        print("BayesFlow model built successfully.")
+    except Exception as e:
+        print(f"Manual build warning: {e}")
+
+    # Standard PyTorch Training Loop
+    with torch.enable_grad():
+        for epoch in range(epochs):
+            epoch_loss = 0.0
             
-            # BayesFlow expects input dict: {"parameters": ..., "summary_conditions": ...}
-            # x_batch needs to be (batch, n_obs, d_x)
-            # Our x_batch is (batch, n_obs, d_x)
+            for x_batch, theta_batch in train_loader:
+                # Move data to device
+                x_batch = x_batch.to(device).float()
+                theta_batch = theta_batch.to(device).float()
+                
+                batch_dict = {
+                    "inference_variables": theta_batch,
+                    "summary_variables": x_batch
+                }
+                
+                optimizer.zero_grad()
+                
+                # Compute loss using the model's compute_loss method (BayesFlow 2 / Keras 3)
+                loss = amortized_posterior.compute_loss(batch_dict)
+                
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
             
-            batch_dict = {
-                "parameters": theta_batch,
-                "summary_conditions": x_batch
-            }
+            scheduler.step()
+            avg_loss = epoch_loss / len(train_loader)
+            loss_history.append(avg_loss)
             
-            optimizer.zero_grad()
-            loss = amortized_posterior.compute_loss(batch_dict)
-            loss.backward()
-            optimizer.step()
-            
-            epoch_loss += loss.item()
-            
-        scheduler.step()
-        avg_loss = epoch_loss / len(train_loader)
-        loss_history.append(avg_loss)
-        
-        if (epoch + 1) % 50 == 0:
-            print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
+            if (epoch + 1) % 10 == 0:
+                 print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
             
     print(f"Training finished in {time.time() - start_time:.2f}s")
     
-    # Wrap in our wrapper
-    wrapper = BayesFlowWrapper(amortized_posterior, d=d)
-    return wrapper, loss_history
+    return amortized_posterior, loss_history
 
 def plot_loss(loss_history, title="Training Loss"):
     plt.figure(figsize=(10, 5))
@@ -184,20 +194,41 @@ def plot_loss(loss_history, title="Training Loss"):
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.grid(True)
-    plt.savefig(f"Gaussian/results/loss_{title.lower().replace(' ', '_')}.png")
+    plt.savefig(f"results/loss_{title.lower().replace(' ', '_')}.png")
     plt.close()
 
 def plot_posterior(theta_samples, theta_true, method_name):
-    # Select first 2 dimensions for plotting
-    df = pd.DataFrame(theta_samples[:, :2], columns=['theta1', 'theta2'])
+    """
+    Plots the marginal posterior for each of the 5 dimensions in a single row.
+    """
+    num_params = theta_samples.shape[1]
+    # Ensure we have at least 5 dimensions or plot all available
+    cols = num_params
     
-    plt.figure(figsize=(8, 8))
-    sns.kdeplot(data=df, x='theta1', y='theta2', fill=True, alpha=0.5, label='Posterior')
-    plt.scatter(theta_true[0], theta_true[1], c='red', marker='*', s=100, label='True Parameter')
-    plt.title(f"Posterior Approximation ({method_name})")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(f"Gaussian/results/posterior_{method_name.lower().replace(' ', '_')}.png")
+    fig, axes = plt.subplots(1, cols, figsize=(4 * cols, 4))
+    if cols == 1:
+        axes = [axes]
+    
+    # Create DataFrame for easier plotting with seaborn
+    df = pd.DataFrame(theta_samples, columns=[f'theta{i+1}' for i in range(num_params)])
+    
+    for i in range(cols):
+        ax = axes[i]
+        param_name = f'theta{i+1}'
+        
+        # Plot KDE
+        sns.kdeplot(data=df, x=param_name, fill=True, alpha=0.5, ax=ax, label='Posterior')
+        
+        # Plot True Parameter
+        if i < len(theta_true):
+            ax.axvline(x=theta_true[i], color='red', linestyle='--', linewidth=2, label='True Parameter')
+            
+        ax.set_title(f'Marginal {param_name}')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+    plt.tight_layout()
+    plt.savefig(f"results/posterior_{method_name.lower().replace(' ', '_')}.png")
     plt.close()
 
 def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, epochs=30, device=DEVICE):
@@ -232,6 +263,18 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, epo
     n_samples = 1000
     if hasattr(model, "sample_posterior"):
         posterior_samples = model.sample_posterior(x_obs, n_samples)
+    elif hasattr(model, "sample"): # BayesFlow
+        # model.sample(conditions=..., num_samples=...)
+        x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
+        
+        # Update for Keras 3 with explicit adapter
+        conditions_dict = {"summary_variables": x_obs_tensor}
+        posterior_samples = model.sample(conditions=conditions_dict, num_samples=n_samples)
+        
+        # Flatten: (1, n_samples, d) -> (n_samples, d)
+        posterior_samples = posterior_samples.reshape(n_samples, -1)
+        if isinstance(posterior_samples, torch.Tensor):
+            posterior_samples = posterior_samples.cpu().numpy()
     else:
         # Fallback (should typically not happen if wrappers are correct)
         print("Model does not support sample_posterior, skipping inference.")
@@ -275,18 +318,17 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, epo
 
 def main():
     # Create results directory
-    os.makedirs("Gaussian/results", exist_ok=True)
+    os.makedirs("results", exist_ok=True)
     
     # Configuration
     # Models to run and their epochs
     MODELS_CONFIG = {
-        "smmd": 30,
+        "smmd": 500,
         "mmd": 30,
-        "bayesflow": 30
+        "bayesflow": 10
     }
-    # To run specific models, just comment out others in the dict or filter keys
-    # MODELS_TO_RUN = ["smmd", "mmd", "bayesflow"] 
-    MODELS_TO_RUN = list(MODELS_CONFIG.keys())
+    # MODELS_TO_RUN = list(MODELS_CONFIG.keys())
+    MODELS_TO_RUN = ["smmd", "bayesflow"]
 
     # 1. Data Generation (Shared across models for fair comparison in one round)
     print("=== Step 1: Data Generation ===")
@@ -329,7 +371,7 @@ def main():
         
         print(f"Inverted 3D obs to 2D for PyMC. Shape: {x_obs_2d.shape}")
         
-        pymc_samples = run_pymc(x_obs_2d, n_draws=2000, n_tune=3000, chains=200)
+        pymc_samples = run_pymc(x_obs_2d, n_draws=2000, n_tune=3000, chains=20)
         print(f"PyMC Samples Shape: {pymc_samples.shape}")
         plot_posterior(pymc_samples, theta_true, "PyMC_Reference")
     except Exception as e:
