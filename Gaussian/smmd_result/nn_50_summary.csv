@@ -1,7 +1,0 @@
-Metric,Value
-Average Training Time,00:00:06
-Average Refinement Time,00:01:49
-MMD_NN Mean,0.378221
-MMD_NN Median,0.378221
-MMD_NN_Refined Mean,0.331855
-MMD_NN_Refined Median,0.331855
