@@ -27,9 +27,10 @@ TRUE_PARAMS = np.array([1.0, 1.0, -1.0, -0.9, 0.6])
 # ============================================================================
 
 class GaussianTask:
-    def __init__(self, prior_type='uniform'):
+    def __init__(self, n=n, prior_type='uniform'):
         """
         Initialize Gaussian Task.
+        n: Number of samples per observation.
         prior_type: 'uniform' (all independent U[-3, 3]) 
                  or 'conditional' (x[1] depends on x[0] via normal)
         """
@@ -95,12 +96,15 @@ class GaussianTask:
             return log_probs[0]
         return log_probs
 
-    def simulator(self, theta, n_samples=n, rng=np.random):
+    def simulator(self, theta, n_samples=None, rng=np.random):
         """
         Simulate data from Gaussian model with stereo projection.
         theta: (batch_size, 5) or (5,)
         Returns: (batch_size, n_samples, 3)
         """
+        if n_samples is None:
+            n_samples = self.n
+
         theta = np.asarray(theta)
         if theta.ndim == 1:
             theta = theta[np.newaxis, :]
@@ -113,10 +117,13 @@ class GaussianTask:
         
         return xs_proj
 
-    def simulator_2d(self, theta, n_samples=n, rng=np.random):
+    def simulator_2d(self, theta, n_samples=None, rng=np.random):
         """
         Internal simulator for 2D Gaussian data (before projection).
         """
+        if n_samples is None:
+            n_samples = self.n
+
         theta = np.asarray(theta)
         if theta.ndim == 1:
             theta = theta[np.newaxis, :]
@@ -165,7 +172,7 @@ class GaussianTask:
         
         # 3D Projected Data (for SMMD/BayesFlow)
         # simulator returns 3D data
-        xs_3d = self.simulator(theta_batch, n_samples=n)[0]
+        xs_3d = self.simulator(theta_batch, n_samples=self.n)[0]
         
         return theta_true, xs_3d
 
@@ -173,12 +180,15 @@ class GaussianTask:
 # 3. Helpers (Dataset Generation)
 # ============================================================================
 
-def generate_dataset(task=None, n_sims=N, n_obs=n):
+def generate_dataset(task=None, n_sims=N, n_obs=None):
     """
     Generates the Reference Table (Theta, X) for training.
     """
     if task is None:
         task = GaussianTask(prior_type='uniform') # Default new setting
+    
+    if n_obs is None:
+        n_obs = task.n
         
     print(f"Generating dataset (N={n_sims})...")
     

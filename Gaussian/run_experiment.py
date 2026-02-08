@@ -5,6 +5,7 @@ Run Experiment for Gaussian Task with SMMD/MMD/BayesFlow and Refinement.
 
 import os
 import time
+import json
 import numpy as np
 import torch
 import torch.optim as optim
@@ -24,12 +25,14 @@ from data_generation import (
     GaussianTask,
     generate_dataset,
     TRUE_PARAMS,
-    n, d, d_x, p
+    d, d_x, p
 )
 from models.smmd import SMMD_Model, sliced_mmd_loss
 from models.mmd import MMD_Model, mmd_loss
 from models.bayesflow_net import build_bayesflow_model
-from utilities import refine_posterior, compute_bandwidth_torch
+from models.dnnabc import DNNABC_Model, train_dnnabc, abc_rejection_sampling
+from models.w2abc import run_w2abc
+from utilities import refine_posterior, compute_bandwidth_torch, compute_mmd_metric
 from pymc_sampler import run_pymc
 
 # Try importing BayesFlow (optional)
@@ -43,13 +46,42 @@ except ImportError:
 # ============================================================================
 # 1. Hyperparameters & Device
 # ============================================================================
-MODEL_TYPE = "smmd"  # Options: "smmd", "mmd", "bayesflow"
+# Default values, will be overridden by config.json if available
 M = 50      # MMD approximation samples
 L = 20      # Slicing directions (for SMMD)
 BATCH_SIZE = 256
-EPOCHS = 500
-LEARNING_RATE = 0.001
 DATASET_SIZE = 25600
+LEARNING_RATE = 1e-3
+NUM_ROUNDS = 5 # Default number of rounds
+n = 50 # Default observation size, will be updated from config
+
+# Load Configuration from JSON
+CONFIG_PATH = "config.json"
+if os.path.exists(CONFIG_PATH):
+    print(f"Loading configuration from {CONFIG_PATH}...")
+    with open(CONFIG_PATH, "r") as f:
+        config = json.load(f)
+        n = config.get("n_observation", n)
+        NUM_ROUNDS = config.get("num_rounds", NUM_ROUNDS)
+        MODELS_CONFIG = config.get("models_config", {
+            "smmd": 500,
+            "mmd": 500,
+            "bayesflow": 20,
+            "dnnabc": 500,
+            "w2abc": 0
+        })
+        MODELS_TO_RUN = config.get("models_to_run", list(MODELS_CONFIG.keys()))
+        print(f"Configuration loaded: n={n}, rounds={NUM_ROUNDS}, models={MODELS_TO_RUN}")
+else:
+    print(f"Warning: {CONFIG_PATH} not found. Using default parameters.")
+    MODELS_CONFIG = {
+        "smmd": 500,
+        "mmd": 500,
+        "bayesflow": 20,
+        "dnnabc": 500,
+        "w2abc": 0
+    }
+    MODELS_TO_RUN = list(MODELS_CONFIG.keys())
 
 # Check for MPS (Apple Silicon) or CUDA
 if torch.backends.mps.is_available():
@@ -121,8 +153,9 @@ def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd"):
         if (epoch + 1) % 10 == 0:
             print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
             
-    print(f"Training finished in {time.time() - start_time:.2f}s")
-    return loss_history
+    training_time = time.time() - start_time
+    print(f"Training finished in {training_time:.2f}s")
+    return loss_history, training_time
 
 def train_bayesflow(train_loader, epochs, device):
     """
@@ -228,21 +261,22 @@ def train_bayesflow(train_loader, epochs, device):
             if (epoch + 1) % 1 == 0: 
                 print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
         
-    print(f"Training finished in {time.time() - start_time:.2f}s")
+    training_time = time.time() - start_time
+    print(f"Training finished in {training_time:.2f}s")
     
-    return amortized_posterior, loss_history
+    return amortized_posterior, loss_history, training_time
 
-def plot_loss(loss_history, title="Training Loss"):
+def plot_loss(loss_history, title="Training Loss", round_id=0):
     plt.figure(figsize=(10, 5))
     plt.plot(loss_history)
-    plt.title(title)
+    plt.title(f"{title} (Round {round_id})")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.grid(True)
-    plt.savefig(f"results/loss_{title.lower().replace(' ', '_')}.png")
+    plt.savefig(f"results/loss_{title.lower().replace(' ', '_')}_round{round_id}.png")
     plt.close()
 
-def plot_posterior(theta_samples, theta_true, method_name):
+def plot_posterior(theta_samples, theta_true, method_name, round_id=0):
     """
     Plots the marginal posterior for each of the 5 dimensions in a single row.
     """
@@ -273,40 +307,64 @@ def plot_posterior(theta_samples, theta_true, method_name):
         ax.grid(True, alpha=0.3)
         
     plt.tight_layout()
-    plt.savefig(f"results/posterior_{method_name.lower().replace(' ', '_')}.png")
+    plt.savefig(f"results/posterior_{method_name.lower().replace(' ', '_')}_round{round_id}.png")
     plt.close()
 
-def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, epochs=30, device=DEVICE):
+def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, round_id, epochs=30, device=DEVICE, n_obs=n):
     """
     Runs a single experiment for a specific model type.
     """
-    print(f"\n=== Running Experiment for {model_type.upper()} (Epochs={epochs}) ===")
+    print(f"\n=== Running Experiment for {model_type.upper()} (Round {round_id}, Epochs={epochs}, n={n_obs}) ===")
     
     # 1. Model Initialization & Training
     model = None
     loss_history = []
+    training_time = 0.0
+    refinement_time = 0.0
+    total_time = 0.0 # For DNNABC/W2ABC
+    
+    t_start_total = time.time()
     
     if model_type == "smmd":
-        model = SMMD_Model(summary_dim=10, d=d, d_x=d_x, n=n)
-        loss_history = train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd")
+        model = SMMD_Model(summary_dim=10, d=d, d_x=d_x, n=n_obs)
+        loss_history, training_time = train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd")
     elif model_type == "mmd":
-        model = MMD_Model(summary_dim=10, d=d, d_x=d_x, n=n)
-        loss_history = train_smmd_mmd(model, train_loader, epochs, device, model_type="mmd")
+        model = MMD_Model(summary_dim=10, d=d, d_x=d_x, n=n_obs)
+        loss_history, training_time = train_smmd_mmd(model, train_loader, epochs, device, model_type="mmd")
     elif model_type == "bayesflow":
         if BAYESFLOW_AVAILABLE:
-            model, loss_history = train_bayesflow(train_loader, epochs, device)
+            model, loss_history, training_time = train_bayesflow(train_loader, epochs, device)
         else:
             print("BayesFlow unavailable, skipping.")
             return None
+    elif model_type == "dnnabc":
+        model = DNNABC_Model(d=d, d_x=d_x, n_points=n_obs)
+        # We treat this as training time, but for final logging we only care about "total time"
+        # However, to be consistent with others, we can track it. 
+        # But user instruction says: "如果是dnnabc和w2则只需要记录整体的时间即可"
+        # So we will sum up later.
+        loss_history = train_dnnabc(model, train_loader, epochs, device)
+    elif model_type == "w2abc":
+        print("W2-ABC does not require neural network training. Proceeding to inference...")
+        loss_history = []
             
-    plot_loss(loss_history, title=f"{model_type.upper()} Loss")
+    if loss_history:
+        plot_loss(loss_history, title=f"{model_type.upper()} Loss", round_id=round_id)
     
     # 2. Model Inference (Amortized)
     print(f"--- Amortized Inference ({model_type}) ---")
     
     # Sample from model
     n_samples = 1000
-    if hasattr(model, "sample_posterior"):
+    
+    if model_type == "w2abc":
+        # W2ABC does inference via SMC, which takes time
+        posterior_samples = run_w2abc(task, x_obs, n_samples=n_samples, max_populations=2) 
+        model = "W2ABC_SMC_Sampler" # Placeholder
+    elif model_type == "dnnabc":
+        # DNNABC does ABC rejection sampling using trained summary net
+        posterior_samples = abc_rejection_sampling(model, x_obs, task, n_samples=n_samples, device=device)
+    elif hasattr(model, "sample_posterior"):
         posterior_samples = model.sample_posterior(x_obs, n_samples)
     elif model_type == "bayesflow":
         # Prepare conditions for sampling
@@ -339,117 +397,247 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, epo
         
     print(f"Posterior Mean: {np.mean(posterior_samples, axis=0)}")
     
-    plot_posterior(posterior_samples, theta_true, f"{model_type}_Amortized")
+    # Save Amortized Samples
+    save_dir_samples = f"results/posterior_samples/{model_type}/round_{round_id}"
+    os.makedirs(save_dir_samples, exist_ok=True)
+    np.save(f"{save_dir_samples}/amortized.npy", posterior_samples)
+    print(f"Saved amortized samples to {save_dir_samples}/amortized.npy")
+    
+    plot_posterior(posterior_samples, theta_true, f"{model_type}_Amortized", round_id=round_id)
     
     # 3. Local Refinement
-    print(f"--- Local Refinement ({model_type}) ---")
+    refined_samples_flat = None
     
-    # Refinement parameters
-    n_chains = 1000
-    burn_in = 99
-    
-    refined_samples = refine_posterior(
-        model, x_obs, task,
-        n_chains=n_chains,
-        n_samples=1,       # Take the last sample
-        burn_in=burn_in,
-        thin=1,
-        nsims=50,
-        epsilon=None,      # Auto-compute bandwidth
-        device=str(device) 
-    )
-    
-    # Reshape refined samples: (n_chains * n_samples, d)
-    refined_samples_flat = refined_samples.reshape(-1, d)
-    
-    print(f"Refined Mean: {np.mean(refined_samples_flat, axis=0)}")
-    
-    plot_posterior(refined_samples_flat, theta_true, f"{model_type}_Refined")
+    if model_type in ["dnnabc", "w2abc"]:
+        print(f"--- Skipping Local Refinement for {model_type} (as requested) ---")
+        refined_samples_flat = posterior_samples # Use amortized/SMC samples as final
+        
+        # For these models, we only care about total time
+        total_time = time.time() - t_start_total
+    else:
+        print(f"--- Local Refinement ({model_type}) ---")
+        
+        t_refine_start = time.time()
+        
+        # Refinement parameters
+        n_chains = 1000
+        burn_in = 99
+        
+        refined_samples = refine_posterior(
+            model, x_obs, task,
+            n_chains=n_chains,
+            n_samples=1,       # Take the last sample
+            burn_in=burn_in,
+            thin=1,
+            nsims=50,
+            epsilon=None,      # Auto-compute bandwidth
+            device=str(device) 
+        )
+        
+        refinement_time = time.time() - t_refine_start
+        print(f"Refinement finished in {refinement_time:.2f}s")
+        
+        # Reshape refined samples: (n_chains * n_samples, d)
+        refined_samples_flat = refined_samples.reshape(-1, d)
+        
+        print(f"Refined Mean: {np.mean(refined_samples_flat, axis=0)}")
+        
+        # Save Refined Samples
+        np.save(f"{save_dir_samples}/refined.npy", refined_samples_flat)
+        print(f"Saved refined samples to {save_dir_samples}/refined.npy")
+        
+        plot_posterior(refined_samples_flat, theta_true, f"{model_type}_Refined", round_id=round_id)
+        
+        total_time = training_time + refinement_time # Though for these we log separately
     
     return {
         "model": model,
         "loss_history": loss_history,
         "amortized_samples": posterior_samples,
-        "refined_samples": refined_samples_flat
+        "refined_samples": refined_samples_flat,
+        "training_time": training_time,
+        "refinement_time": refinement_time,
+        "total_time": total_time
     }
+
+def save_model(model, model_type, round_id):
+    """Saves the model state."""
+    save_dir = f"saved_models/{model_type}"
+    os.makedirs(save_dir, exist_ok=True)
+    filename = f"{save_dir}/round_{round_id}.pt"
+    
+    if model_type == "bayesflow":
+        # Save BayesFlow (Keras) model
+        # Note: Keras 3 saving might be different
+        try:
+             model.save(f"{save_dir}/round_{round_id}.keras")
+             print(f"Saved BayesFlow model to {save_dir}/round_{round_id}.keras")
+        except Exception as e:
+             print(f"Failed to save BayesFlow model (full): {e}")
+             try:
+                 model.save_weights(f"{save_dir}/round_{round_id}.weights.h5")
+                 print(f"Saved BayesFlow weights to {save_dir}/round_{round_id}.weights.h5")
+             except Exception as e2:
+                 print(f"Failed to save BayesFlow weights: {e2}")
+    elif isinstance(model, torch.nn.Module):
+        torch.save(model.state_dict(), filename)
+        print(f"Saved {model_type} model to {filename}")
+    else:
+        print(f"Skipping save for {model_type} (not a torch module or bayesflow).")
 
 def main():
     # Create results directory
     os.makedirs("results", exist_ok=True)
+    os.makedirs("saved_models", exist_ok=True)
     
-    # Configuration
-    # Models to run and their epochs
-    MODELS_CONFIG = {
-        "smmd": 500,
-        "mmd": 500,
-        "bayesflow": 20
-    }
-    # MODELS_TO_RUN = list(MODELS_CONFIG.keys())
-    MODELS_TO_RUN = ["bayesflow"]
+    # Configuration is already loaded at module level
+    # MODELS_CONFIG, MODELS_TO_RUN, NUM_ROUNDS, n are set
+    
+    # Store all results for final CSV
+    all_results = []
+    
+    print(f"Starting Multi-Round Experiment (Total Rounds: {NUM_ROUNDS})")
 
-    # 1. Data Generation (Shared across models for fair comparison in one round)
-    print("=== Step 1: Data Generation ===")
-    task = GaussianTask()
-    
-    # Generate Training Data
-    print(f"Generating training data (size={DATASET_SIZE})...")
-    theta_train, x_train = generate_dataset(task, n_sims=DATASET_SIZE)
-    
-    # Create DataLoader
-    dataset = TensorDataset(
-        torch.from_numpy(x_train).float(),
-        torch.from_numpy(theta_train).float()
-    )
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    
-    # Generate Observation (Ground Truth)
-    print("Generating observation...")
-    theta_true, x_obs = task.get_ground_truth()
-    print(f"True Params: {theta_true}")
-    
-    # 2. PyMC Reference Sampling
-    print("\n=== Step 2: PyMC Reference Sampling ===")
-    
-    # Invert 3D observation to 2D for PyMC (Inverse Stereographic Projection)
-    # x = X / (1 - Z), y = Y / (1 - Z)
-    # x_obs is (n, 3)
-    try:
-        X_comp = x_obs[:, 0]
-        Y_comp = x_obs[:, 1]
-        Z_comp = x_obs[:, 2]
+    for round_idx in range(1, NUM_ROUNDS + 1):
+        print(f"\n{'='*20} ROUND {round_idx}/{NUM_ROUNDS} {'='*20}")
         
-        # Handle numerical stability if Z is close to 1 (shouldn't be for Gaussian on plane)
-        denom = 1.0 - Z_comp
-        denom[np.abs(denom) < 1e-6] = 1e-6 # Avoid division by zero
+        # 1. Data Generation (Shared across models for fair comparison in one round)
+        print("=== Step 1: Data Generation ===")
+        # Use n from config
+        task = GaussianTask(n=n)
         
-        x_2d = X_comp / denom
-        y_2d = Y_comp / denom
-        x_obs_2d = np.stack([x_2d, y_2d], axis=-1)
+        # Generate Training Data
+        print(f"Generating training data (size={DATASET_SIZE}, n={n})...")
+        theta_train, x_train = generate_dataset(task, n_sims=DATASET_SIZE, n_obs=n)
         
-        print(f"Inverted 3D obs to 2D for PyMC. Shape: {x_obs_2d.shape}")
+        # Create DataLoader
+        dataset = TensorDataset(
+            torch.from_numpy(x_train).float(),
+            torch.from_numpy(theta_train).float()
+        )
+        train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
         
-        pymc_samples = run_pymc(x_obs_2d, n_draws=2000, n_tune=3000, chains=20)
-        print(f"PyMC Samples Shape: {pymc_samples.shape}")
-        plot_posterior(pymc_samples, theta_true, "PyMC_Reference")
-    except Exception as e:
-        print(f"PyMC Sampling failed: {e}")
+        # Generate Observation (Ground Truth)
+        print("Generating observation...")
+        theta_true, x_obs = task.get_ground_truth()
+        print(f"True Params: {theta_true}")
+        
+        # Save True Observation
+        obs_save_dir = f"results/true_observations/round_{round_idx}"
+        os.makedirs(obs_save_dir, exist_ok=True)
+        np.save(f"{obs_save_dir}/observation.npy", x_obs)
+        np.save(f"{obs_save_dir}/theta_true.npy", theta_true)
+        print(f"Saved true observation to {obs_save_dir}")
+        
+        # 2. PyMC Reference Sampling
+        print("\n=== Step 2: PyMC Reference Sampling ===")
+        
         pymc_samples = None
-
-    # 3. Run Experiments
-    print("\n=== Step 3: Run Model Experiments ===")
-    
-    if isinstance(MODELS_TO_RUN, str):
-        MODELS_TO_RUN = [MODELS_TO_RUN]
-        
-    for model_type in MODELS_TO_RUN:
-        if model_type not in MODELS_CONFIG:
-            print(f"Warning: No epoch config for {model_type}, skipping.")
-            continue
+        try:
+            # Invert 3D observation to 2D for PyMC (Inverse Stereographic Projection)
+            X_comp = x_obs[:, 0]
+            Y_comp = x_obs[:, 1]
+            Z_comp = x_obs[:, 2]
             
-        epochs = MODELS_CONFIG[model_type]
-        run_single_experiment(model_type, task, train_loader, theta_true, x_obs, epochs=epochs, device=DEVICE)
+            denom = 1.0 - Z_comp
+            denom[np.abs(denom) < 1e-6] = 1e-6 # Avoid division by zero
+            
+            x_2d = X_comp / denom
+            y_2d = Y_comp / denom
+            x_obs_2d = np.stack([x_2d, y_2d], axis=-1)
+            
+            print(f"Inverted 3D obs to 2D for PyMC. Shape: {x_obs_2d.shape}")
+            
+            # Reduce draws/tune slightly for speed in multi-round (optional, keeping high for quality)
+            pymc_samples = run_pymc(x_obs_2d, n_draws=2000, n_tune=3000, chains=20)
+            print(f"PyMC Samples Shape: {pymc_samples.shape}")
+            plot_posterior(pymc_samples, theta_true, "PyMC_Reference", round_id=round_idx)
+            
+            # Save PyMC Samples
+            pymc_save_dir = f"results/posterior_samples/pymc_reference/round_{round_idx}"
+            os.makedirs(pymc_save_dir, exist_ok=True)
+            np.save(f"{pymc_save_dir}/samples.npy", pymc_samples)
+            print(f"Saved PyMC samples to {pymc_save_dir}/samples.npy")
+            
+        except Exception as e:
+            print(f"PyMC Sampling failed: {e}")
+            pymc_samples = None
     
-    print("\nAll Experiments Completed.")
+        # 3. Run Experiments
+        print("\n=== Step 3: Run Model Experiments ===")
+        
+        current_models_to_run = MODELS_TO_RUN
+        if isinstance(current_models_to_run, str):
+            current_models_to_run = [current_models_to_run]
+            
+        for model_type in current_models_to_run:
+            if model_type not in MODELS_CONFIG:
+                print(f"Warning: No epoch config for {model_type}, skipping.")
+                continue
+                
+            epochs = MODELS_CONFIG[model_type]
+            
+            # Run Experiment
+            # Pass n from config
+            result = run_single_experiment(model_type, task, train_loader, theta_true, x_obs, round_id=round_idx, epochs=epochs, device=DEVICE, n_obs=n)
+            
+            if result is None:
+                continue
+                
+            # Compute MMD Metrics
+            mmd_amortized = 0.0
+            mmd_refined = 0.0
+            
+            if pymc_samples is not None:
+                # Amortized MMD
+                if result["amortized_samples"] is not None:
+                    mmd_amortized = compute_mmd_metric(result["amortized_samples"], pymc_samples)
+                    print(f"MMD ({model_type} Amortized): {mmd_amortized:.4f}")
+                    
+                # Refined MMD
+                if result["refined_samples"] is not None:
+                    mmd_refined = compute_mmd_metric(result["refined_samples"], pymc_samples)
+                    print(f"MMD ({model_type} Refined): {mmd_refined:.4f}")
+            else:
+                print("Skipping MMD calculation (No PyMC samples).")
+
+            # Save Model
+            save_model(result["model"], model_type, round_idx)
+            
+            # Record Results
+            record = {
+                "round": round_idx,
+                "model_name": model_type,
+                "training_time": result["training_time"],
+                "refinement_time": result["refinement_time"],
+                "total_time": result["total_time"],
+                "mmd_amortized": mmd_amortized,
+                "mmd_refined": mmd_refined
+            }
+            all_results.append(record)
+            
+            # Save CSV incrementally (optional, but good for safety)
+            pd.DataFrame(all_results).to_csv("results/experiment_results.csv", index=False)
+    
+    # 4. Summary Statistics
+    print("\n=== Experiment Summary ===")
+    df = pd.DataFrame(all_results)
+    
+    # Calculate Mean and Median
+    # Group by model_name
+    summary_mean = df.groupby("model_name").mean(numeric_only=True).drop(columns=["round"])
+    summary_median = df.groupby("model_name").median(numeric_only=True).drop(columns=["round"])
+    
+    print("Mean Metrics:")
+    print(summary_mean)
+    print("\nMedian Metrics:")
+    print(summary_median)
+    
+    # Save Summary
+    summary_mean.to_csv("results/summary_mean.csv")
+    summary_median.to_csv("results/summary_median.csv")
+    
+    print("\nAll Experiments Completed. Results saved to 'results/' directory.")
 
 if __name__ == "__main__":
     main()

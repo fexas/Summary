@@ -256,3 +256,89 @@ def compute_bandwidth_torch(model, *args, **kwargs):
         return compute_bandwidth_bayesflow(model, *args, **kwargs)
     else:
         return compute_bandwidth_smmd(model, *args, **kwargs)
+
+# =============================================================================
+# MMD Metric (Evaluation)
+# =============================================================================
+
+def compute_mmd_metric(samples_approx, samples_true):
+    """
+    Compute Maximum Mean Discrepancy (MMD) between approximate and true posterior samples.
+    Kernel: Gaussian RBF kernel k(x, y) = exp(-||x-y||^2 / h^2)
+    Bandwidth h: Median of pairwise L2 distances of true posterior samples.
+    
+    Args:
+        samples_approx: (n_samples_a, d) numpy array
+        samples_true: (n_samples_b, d) numpy array
+    Returns:
+        mmd_value: Scalar MMD value
+    """
+    # Ensure numpy arrays
+    if isinstance(samples_approx, torch.Tensor):
+        samples_approx = samples_approx.detach().cpu().numpy()
+    if isinstance(samples_true, torch.Tensor):
+        samples_true = samples_true.detach().cpu().numpy()
+        
+    # Subsample if too large for pairwise computation (optional, but recommended for speed)
+    # If N > 2000, subsample to 2000 for metric calculation
+    n_max = 2000
+    if samples_approx.shape[0] > n_max:
+        idx = np.random.choice(samples_approx.shape[0], n_max, replace=False)
+        samples_approx = samples_approx[idx]
+    if samples_true.shape[0] > n_max:
+        idx = np.random.choice(samples_true.shape[0], n_max, replace=False)
+        samples_true = samples_true[idx]
+        
+    X = samples_approx
+    Y = samples_true
+    
+    nx = X.shape[0]
+    ny = Y.shape[0]
+    
+    # 1. Compute Bandwidth h from True Samples (Y)
+    # Pairwise squared Euclidean distances for Y
+    # ||y_i - y_j||^2 = ||y_i||^2 + ||y_j||^2 - 2 <y_i, y_j>
+    Y_sq = np.sum(Y**2, axis=1, keepdims=True)
+    D_YY_sq = Y_sq + Y_sq.T - 2 * np.dot(Y, Y.T)
+    # Numerical stability
+    D_YY_sq = np.maximum(D_YY_sq, 0)
+    D_YY = np.sqrt(D_YY_sq)
+    
+    # Extract upper triangle (excluding diagonal which is 0)
+    # np.triu_indices returns indices for upper triangle
+    # k=1 excludes diagonal
+    triu_idx = np.triu_indices(ny, k=1)
+    pairwise_dists = D_YY[triu_idx]
+    
+    h = np.median(pairwise_dists)
+    h_sq = h**2
+    
+    if h_sq < 1e-9:
+        h_sq = 1.0 # Fallback if degenerate
+        
+    # 2. Compute MMD^2
+    # k(x, y) = exp(- ||x-y||^2 / h^2)
+    
+    def rbf_kernel(A, B, h_sq):
+        A_sq = np.sum(A**2, axis=1, keepdims=True)
+        B_sq = np.sum(B**2, axis=1, keepdims=True)
+        D_AB_sq = A_sq + B_sq.T - 2 * np.dot(A, B.T)
+        D_AB_sq = np.maximum(D_AB_sq, 0)
+        return np.exp(-D_AB_sq / h_sq)
+    
+    K_XX = rbf_kernel(X, X, h_sq)
+    K_YY = rbf_kernel(Y, Y, h_sq)
+    K_XY = rbf_kernel(X, Y, h_sq)
+    
+    # Unbiased MMD^2 estimator usually excludes diagonal for XX and YY, 
+    # but standard V-statistic includes them. 
+    # Let's use the standard form: mean(K_XX) + mean(K_YY) - 2*mean(K_XY)
+    
+    mmd_sq = np.mean(K_XX) + np.mean(K_YY) - 2 * np.mean(K_XY)
+    
+    # Return sqrt(MMD^2) -> MMD
+    # Numerical noise can make mmd_sq slightly negative
+    mmd_value = np.sqrt(np.maximum(mmd_sq, 0))
+    
+    return mmd_value
+
