@@ -16,6 +16,9 @@ import pandas as pd
 if "KERAS_BACKEND" not in os.environ:
     os.environ["KERAS_BACKEND"] = "torch"
 
+import keras
+
+
 # Import from local modules
 from data_generation import (
     GaussianTask,
@@ -48,16 +51,17 @@ EPOCHS = 500
 LEARNING_RATE = 0.001
 DATASET_SIZE = 25600
 
-# Check for MPS (Apple Silicon)
+# Check for MPS (Apple Silicon) or CUDA
 if torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
-    print("Using MPS (Apple Silicon) acceleration.")
+    print(f"✅ Using MPS (Apple Silicon) acceleration. Device: {DEVICE}")
 elif torch.cuda.is_available():
     DEVICE = torch.device("cuda")
-    print("Using CUDA acceleration.")
+    # Set default tensor type to cuda if desired, but explicit placement is better
+    print(f"✅ Using CUDA acceleration. Device: {DEVICE} ({torch.cuda.get_device_name(0)})")
 else:
     DEVICE = torch.device("cpu")
-    print("Using CPU.")
+    print(f"ℹ️ Using CPU. Device: {DEVICE}")
 
 def get_scheduler(optimizer, epochs):
     """Cosine Decay Scheduler"""
@@ -71,6 +75,10 @@ def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd"):
     model.to(device)
     model.train()
     
+    # Verify device placement
+    param_device = next(model.parameters()).device
+    print(f"Model {model_type.upper()} initialized on: {param_device}")
+
     loss_history = []
     
     print(f"Starting training ({model_type})...")
@@ -117,72 +125,109 @@ def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd"):
     return loss_history
 
 def train_bayesflow(train_loader, epochs, device):
-    """Training loop for BayesFlow using native PyTorch backend."""
+    """
+    Train BayesFlow model using Keras training loop.
+    """
     if not BAYESFLOW_AVAILABLE:
         raise ImportError("BayesFlow is not available.")
         
-    # Build model using factory function
-    amortized_posterior = build_bayesflow_model(d=d, d_x=d_x, summary_dim=10)
+    print("Starting training (BayesFlow with Keras Loop)...")
     
-    # Use native PyTorch Optimizer
-    # Note: Keras 3 models (with torch backend) wrap torch.nn.Module, so .parameters() works
-    optimizer = optim.Adam(amortized_posterior.parameters(), lr=LEARNING_RATE)
-    scheduler = get_scheduler(optimizer, epochs)
+    # Build model (ensure it's created on the correct device)
+    # Keras 3 with Torch backend creates weights on the default torch device or current device context
+    if device.type == "cuda":
+        # Use context manager to ensure parameters are initialized on GPU
+        print(f"Initializing BayesFlow model on {device}...")
+        with torch.device(device):
+             amortized_posterior = build_bayesflow_model(d, d_x, summary_dim=10)
+    else:
+        # For MPS/CPU, standard build is usually fine, but explicit doesn't hurt
+        amortized_posterior = build_bayesflow_model(d, d_x, summary_dim=10)
     
-    # Move model to device
-    amortized_posterior.to(device)
-    
-    loss_history = []
-    
-    print("Starting training (BayesFlow with PyTorch Loop)...")
-    start_time = time.time()
+    # Verify device placement (optional check)
+    try:
+        # Access a weight to check device
+        # Note: Keras 3 weights might need .value to get the tensor
+        if hasattr(amortized_posterior, "summary_network") and hasattr(amortized_posterior.summary_network, "weights") and len(amortized_posterior.summary_network.weights) > 0:
+            first_weight = amortized_posterior.summary_network.weights[0]
+            if hasattr(first_weight, "value"):
+                w_device = first_weight.value.device
+            else:
+                w_device = first_weight.device
+            print(f"Model weights initialized on: {w_device}")
+    except Exception as e:
+        # This is just a check, don't fail if it doesn't work (e.g. weights not yet created)
+        pass
     
     # Manual build (one forward pass) to initialize weights
-    # This is often needed for Keras models to build layers
     try:
         first_x, first_theta = next(iter(train_loader))
+        # Keep on CPU for adapter
         dummy_dict = {
-            "inference_variables": first_theta.to(device).float(),
-            "summary_variables": first_x.to(device).float()
+            "inference_variables": first_theta.float(),
+            "summary_variables": first_x.float()
         }
-        # Run one forward pass
-        amortized_posterior(dummy_dict)
+        
+        # Explicitly initialize adapter
+        if hasattr(amortized_posterior, "adapter"):
+             _ = amortized_posterior.adapter(dummy_dict)
+        
+        # Run one forward pass via log_prob to build networks
+        _ = amortized_posterior.log_prob(dummy_dict)
         print("BayesFlow model built successfully.")
     except Exception as e:
         print(f"Manual build warning: {e}")
-
-    # Standard PyTorch Training Loop
-    with torch.enable_grad():
-        for epoch in range(epochs):
-            epoch_loss = 0.0
+        
+    # Compile model
+    optimizer = keras.optimizers.Adam(learning_rate=LEARNING_RATE)
+    amortized_posterior.compile(optimizer=optimizer)
+    
+    loss_history = []
+    
+    start_time = time.time()
+    
+    for epoch in range(epochs):
+        epoch_loss = 0
+        num_batches = 0
+        
+        for x_batch, theta_batch in train_loader:
+            # Keep data on CPU for BayesFlow adapter
+            x_batch_cpu = x_batch.float()
+            theta_batch_cpu = theta_batch.float()
             
-            for x_batch, theta_batch in train_loader:
-                # Move data to device
-                x_batch = x_batch.to(device).float()
-                theta_batch = theta_batch.to(device).float()
-                
-                batch_dict = {
-                    "inference_variables": theta_batch,
-                    "summary_variables": x_batch
-                }
-                
-                optimizer.zero_grad()
-                
-                # Compute loss using the model's compute_loss method (BayesFlow 2 / Keras 3)
-                loss = amortized_posterior.compute_loss(batch_dict)
-                
-                loss.backward()
-                optimizer.step()
-                
-                epoch_loss += loss.item()
+            batch_dict = {
+                "inference_variables": theta_batch_cpu,
+                "summary_variables": x_batch_cpu
+            }
             
-            scheduler.step()
-            avg_loss = epoch_loss / len(train_loader)
+            try:
+                # Use Keras train_step
+                metrics = amortized_posterior.train_step(batch_dict)
+                
+                # metrics is a dict, extract loss
+                # Usually key is "loss"
+                loss_val = metrics.get("loss", list(metrics.values())[0])
+                
+                # loss_val might be a tensor or scalar
+                if hasattr(loss_val, "item"):
+                    loss_val = loss_val.item()
+                else:
+                    loss_val = float(loss_val)
+                    
+                epoch_loss += loss_val
+                num_batches += 1
+            except Exception as e:
+                print(f"Error in train_step: {e}")
+                break
+        
+        if num_batches > 0:
+            avg_loss = epoch_loss / num_batches
             loss_history.append(avg_loss)
             
-            if (epoch + 1) % 10 == 0:
-                 print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
-            
+            # Progress reporting
+            if (epoch + 1) % 1 == 0: 
+                print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
+        
     print(f"Training finished in {time.time() - start_time:.2f}s")
     
     return amortized_posterior, loss_history
@@ -263,18 +308,30 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, epo
     n_samples = 1000
     if hasattr(model, "sample_posterior"):
         posterior_samples = model.sample_posterior(x_obs, n_samples)
-    elif hasattr(model, "sample"): # BayesFlow
-        # model.sample(conditions=..., num_samples=...)
-        x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
+    elif model_type == "bayesflow":
+        # Prepare conditions for sampling
+        # BayesFlow expects conditions as dict (via adapter)
+        # IMPORTANT: Adapter requires CPU/Numpy data
+        if isinstance(x_obs, torch.Tensor):
+             x_obs_cpu = x_obs.detach().cpu().numpy()
+        else:
+             x_obs_cpu = np.asarray(x_obs)
+             
+        # Add batch dim if needed
+        if x_obs_cpu.ndim == 2:
+            x_obs_cpu = x_obs_cpu[np.newaxis, ...]
+            
+        conditions_dict = {"summary_variables": x_obs_cpu}
         
-        # Update for Keras 3 with explicit adapter
-        conditions_dict = {"summary_variables": x_obs_tensor}
+        # Sample
         posterior_samples = model.sample(conditions=conditions_dict, num_samples=n_samples)
         
-        # Flatten: (1, n_samples, d) -> (n_samples, d)
-        posterior_samples = posterior_samples.reshape(n_samples, -1)
-        if isinstance(posterior_samples, torch.Tensor):
-            posterior_samples = posterior_samples.cpu().numpy()
+        # Output might be dict
+        if isinstance(posterior_samples, dict):
+             posterior_samples = posterior_samples["inference_variables"]
+             
+        # Shape: (1, n_samples, d) -> (n_samples, d)
+        posterior_samples = posterior_samples.reshape(-1, d)
     else:
         # Fallback (should typically not happen if wrappers are correct)
         print("Model does not support sample_posterior, skipping inference.")
@@ -324,11 +381,11 @@ def main():
     # Models to run and their epochs
     MODELS_CONFIG = {
         "smmd": 500,
-        "mmd": 30,
-        "bayesflow": 10
+        "mmd": 500,
+        "bayesflow": 20
     }
     # MODELS_TO_RUN = list(MODELS_CONFIG.keys())
-    MODELS_TO_RUN = ["smmd", "bayesflow"]
+    MODELS_TO_RUN = ["bayesflow"]
 
     # 1. Data Generation (Shared across models for fair comparison in one round)
     print("=== Step 1: Data Generation ===")

@@ -179,32 +179,28 @@ def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_lev
     print("Computing bandwidth for BayesFlow refinement...")
     x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
     
+    # BayesFlow adapter needs CPU/Numpy
+    x_obs_cpu = x_obs_tensor.cpu().numpy()
+    
     # Sample from BayesFlow model
     # model.sample(conditions=...) returns (n_samples, batch, d) or (batch, n_samples, d)
-    # x_obs_tensor is (1, n, d_x)
-    # We want n_samples
-    
-    # Check if we need to wrap conditions in dict (depends on BF version/config)
-    # Assuming ContinuousApproximator with default inputs
-    conditions = {"summary_conditions": x_obs_tensor} # Legacy or specific config
-    # OR direct tensor if summary network expects it. 
-    # Let's try direct tensor as `summary_variables` or `conditions`.
-    # Based on previous error log: `inference_network.log_prob` took `conditions`.
-    # `ContinuousApproximator.sample` signature: (num_samples, batch_size, ...)
-    
-    # Let's use the standard `sample` method
-    # It usually handles dict wrapping if adapter is used.
-    # If we pass tensor, it might need to be named.
-    # However, model.sample(conditions=x_obs_tensor, num_samples=n_samples) usually works if no adapter or simple adapter.
     
     # Update for Keras 3 with explicit adapter (requires dict)
-    conditions_dict = {"summary_variables": x_obs_tensor}
+    conditions_dict = {"summary_variables": x_obs_cpu}
     Theta0_np = model.sample(conditions=conditions_dict, num_samples=n_samples)
     
+    # Handle Dict output (BayesFlow/Keras3)
+    if isinstance(Theta0_np, dict):
+        Theta0_np = Theta0_np["inference_variables"]
+    
     # Theta0_np shape: (1, n_samples, d) (since batch_size=1)
-    Theta0_np = Theta0_np.reshape(n_samples, -1)
+    # Ensure numpy array
     if isinstance(Theta0_np, torch.Tensor):
-        Theta0_np = Theta0_np.cpu().numpy()
+        Theta0_np = Theta0_np.detach().cpu().numpy()
+    elif not isinstance(Theta0_np, np.ndarray):
+         Theta0_np = np.asarray(Theta0_np)
+         
+    Theta0_np = Theta0_np.reshape(n_samples, -1)
         
     return compute_bandwidth_core(Theta0_np, x_obs_tensor, task, model.summary_network, n_samples, quantile_level, device)
 
@@ -222,12 +218,22 @@ def refine_posterior_bayesflow(model, x_obs, task,
     with torch.no_grad():
         x_obs_stats = model.summary_network(x_obs_tensor)
         
-        # Initial samples
-        conditions_dict = {"summary_variables": x_obs_tensor}
+        # BayesFlow adapter needs CPU/Numpy
+        x_obs_cpu = x_obs_tensor.cpu().numpy()
+        conditions_dict = {"summary_variables": x_obs_cpu}
         current_theta = model.sample(conditions=conditions_dict, num_samples=n_chains)
-        current_theta = current_theta.reshape(n_chains, -1)
+        
+        # Handle Dict output (BayesFlow/Keras3)
+        if isinstance(current_theta, dict):
+            current_theta = current_theta["inference_variables"]
+            
+        # Ensure numpy array
         if isinstance(current_theta, torch.Tensor):
-            current_theta = current_theta.cpu().numpy()
+            current_theta = current_theta.detach().cpu().numpy()
+        elif not isinstance(current_theta, np.ndarray):
+             current_theta = np.asarray(current_theta)
+             
+        current_theta = current_theta.reshape(n_chains, -1)
             
     # 2. Define Likelihood Function
     def likelihood_fn(theta, target_stats):

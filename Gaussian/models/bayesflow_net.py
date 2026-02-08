@@ -17,9 +17,41 @@ import torch
 import numpy as np
 import keras
 import bayesflow as bf
+from bayesflow.adapters.transforms import Transform
 
 # Force CPU device for Keras to avoid MPS issues
 keras.config.set_floatx("float32")
+
+# ============================================================================
+# 0. Custom Adapter Transform (Fix MPS Issue)
+# ============================================================================
+
+class ToNumpy(Transform):
+    """
+    Custom Transform to convert Torch Tensors (CPU or MPS) to Numpy arrays
+    AND cast to float32.
+    Replaces standard ToArray and ConvertDType to handle MPS devices and dicts gracefully.
+    """
+    def forward(self, data, **kwargs):
+        if isinstance(data, dict):
+            return {k: self._to_numpy(v) for k, v in data.items()}
+        return self._to_numpy(data)
+    
+    def _to_numpy(self, x):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        else:
+            x = np.asarray(x)
+        return x.astype("float32")
+
+    def inverse(self, data, **kwargs):
+        """
+        Inverse transform: Identity.
+        BayesFlow calls this during sampling. Since we just converted to numpy for the network,
+        the output from the network is already compatible or will be handled by the user.
+        We just return the data as is.
+        """
+        return data
 
 # ============================================================================
 # 1. Neural Networks
@@ -93,9 +125,9 @@ class DeepSetsSummary(keras.Model):
         
         settings = dict(
             num_dense_s1=2, num_dense_s2=2, num_dense_s3=2,
-            dense_s1_args={"units": 32},
-            dense_s2_args={"units": 32},
-            dense_s3_args={"units": 32},
+            dense_s1_args={"units": 64},
+            dense_s2_args={"units": 64},
+            dense_s3_args={"units": 64},
             input_dim=input_dim
         )
         
@@ -121,6 +153,9 @@ class DeepSetsSummary(keras.Model):
         x = self.equiv2(x)
         x = self.inv3(x)
         return self.out_layer(x)
+        
+    def build(self, input_shape):
+        super().build(input_shape)
         
     def compute_output_shape(self, input_shape):
         return (input_shape[0], self.out_layer.units)
@@ -159,11 +194,12 @@ def build_bayesflow_model(d, d_x, summary_dim=10):
     )
     
     # 3. Adapter
-    # Explicitly build adapter to handle keys
-    adapter = bf.ContinuousApproximator.build_adapter(
-        inference_variables=["inference_variables"],
-        summary_variables=["summary_variables"]
-    )
+    # Custom Adapter to handle MPS tensors (replaces default build_adapter)
+    # The default build_adapter uses ToArray which fails on MPS tensors.
+    # Also handles dtype conversion internally to avoid 'dict' object has no attribute 'astype' error.
+    adapter = bf.Adapter([
+        ToNumpy()
+    ])
     
     # 4. Approximator
     approximator = MyContinuousApproximator(
