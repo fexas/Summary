@@ -40,28 +40,73 @@ class W2Distance(pyabc.Distance):
         
         return np.sqrt(w2_sq)
 
-def run_w2abc(task, x_obs, n_samples=1000, max_populations=10, result_dir="results"):
+class SummaryDistance(pyabc.Distance):
     """
-    Run W2-ABC using PyABC SMC.
+    Euclidean Distance on Summary Statistics.
+    d(x, y) = ||S(x) - S(y)||_2
+    """
+    def __init__(self, summary_network, device="cpu"):
+        self.summary_network = summary_network
+        self.device = device
+
+    def __call__(self, x, y, t=None, par=None):
+        # x, y are dicts {'data': np.array (n, d_x)}
+        X = x['data']
+        Y = y['data']
+        
+        # Prepare for network
+        # Network expects (batch, n, d_x)
+        # We need to handle single instance
+        
+        def get_summary(data):
+            # data: (n, d_x)
+            data_tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0).to(self.device)
+            # Check if summary_network is Keras or Torch
+            if hasattr(self.summary_network, "predict"): # Keras/TF (BayesFlow usually)
+                 # Keras expect numpy or tensor. BayesFlow networks usually take dict or tensor.
+                 # Based on load_models.py, bayesflow model is Keras. 
+                 # model.summary_network(x)
+                 # We might need to convert to numpy if it's Keras
+                 data_np = data_tensor.cpu().numpy()
+                 # BayesFlow summary net often takes (batch, n, dx)
+                 # Return shape (batch, summary_dim)
+                 s = self.summary_network(data_np)
+                 if hasattr(s, "cpu"):
+                     s = s.cpu()
+                 if hasattr(s, "numpy"):
+                     s = s.numpy()
+                 return torch.tensor(s).squeeze(0) # (summary_dim,)
+                 
+            else: # Torch
+                with torch.no_grad():
+                    s = self.summary_network(data_tensor)
+                return s.cpu().squeeze(0) # (summary_dim,)
+
+        sx = get_summary(X)
+        sy = get_summary(Y)
+        
+        # Euclidean distance
+        return torch.norm(sx - sy).item()
+
+def run_smc_abc(task, x_obs, n_samples=1000, max_populations=10, 
+                result_dir="results", distance_metric="w2", summary_network=None, device="cpu"):
+    """
+    Run ABC using PyABC SMC.
     
     Args:
         task: GaussianTask instance
         x_obs: Observation (n, d_x)
-        n_samples: Population size (number of particles)
-        max_populations: Max number of SMC generations
-        
-    Returns:
-        samples: (n_samples, d) numpy array
+        n_samples: Population size
+        max_populations: Max generations
+        distance_metric: "w2" or "summary"
+        summary_network: Required if distance_metric="summary"
     """
-    print(f"\n=== Running W2-ABC (Population={n_samples}, Max Gen={max_populations}) ===")
+    metric_name = distance_metric.upper()
+    print(f"\n=== Running {metric_name}-ABC (Population={n_samples}, Max Gen={max_populations}) ===")
     
     # 1. Define Prior
-    # GaussianTask uses Uniform[lower, upper]
-    # keys: theta0, theta1, ...
     prior_dict = {}
     for i in range(task.d):
-        # pyabc uses scipy.stats distributions
-        # Uniform(loc, scale) -> [loc, loc+scale]
         loc = task.lower[i]
         scale = task.upper[i] - task.lower[i]
         prior_dict[f"theta{i}"] = pyabc.RV("uniform", loc, scale)
@@ -70,24 +115,23 @@ def run_w2abc(task, x_obs, n_samples=1000, max_populations=10, result_dir="resul
     
     # 2. Define Model Wrapper
     def model_wrapper(params):
-        # params is dict {'theta0': v0, ...}
-        # Convert to array (1, d)
         theta = np.zeros(task.d)
         for i in range(task.d):
             theta[i] = params[f"theta{i}"]
-            
-        # Simulate
-        # task.simulator returns (1, n, d_x)
         x_sim = task.simulator(theta[np.newaxis, :])[0]
-        
         return {'data': x_sim}
         
     # 3. Define Distance
-    distance = W2Distance()
+    if distance_metric == "w2":
+        distance = W2Distance()
+    elif distance_metric == "summary":
+        if summary_network is None:
+            raise ValueError("summary_network must be provided for summary distance")
+        distance = SummaryDistance(summary_network, device)
+    else:
+        raise ValueError(f"Unknown distance metric: {distance_metric}")
     
     # 4. Setup ABC SMC
-    # Use SingleCoreSampler for simplicity and to avoid multiprocessing issues in some envs
-    # Or MulticoreEvalParallelSampler if needed
     abc = pyabc.ABCSMC(
         models=model_wrapper,
         parameter_priors=prior,
@@ -97,7 +141,6 @@ def run_w2abc(task, x_obs, n_samples=1000, max_populations=10, result_dir="resul
     )
     
     # 5. Prepare Observation
-    # x_obs might be (1, n, d) or (n, d)
     if x_obs.ndim == 3:
         x_obs_data = x_obs[0]
     else:
@@ -105,7 +148,8 @@ def run_w2abc(task, x_obs, n_samples=1000, max_populations=10, result_dir="resul
         
     # Database
     os.makedirs(result_dir, exist_ok=True)
-    db_path = os.path.join(result_dir, "w2abc_temp.db")
+    db_name = f"{distance_metric}abc_temp.db"
+    db_path = os.path.join(result_dir, db_name)
     if os.path.exists(db_path):
         os.remove(db_path)
     db_url = "sqlite:///" + db_path
@@ -116,22 +160,20 @@ def run_w2abc(task, x_obs, n_samples=1000, max_populations=10, result_dir="resul
     history = abc.run(max_nr_populations=max_populations)
     
     # 7. Extract Samples
-    # Get the last population
     df, w = history.get_distribution(m=0, t=history.max_t)
     
-    # df has columns theta0, theta1...
-    # We need to convert to (n_samples, d) array in correct order
     samples = np.zeros((len(df), task.d))
     for i in range(task.d):
         samples[:, i] = df[f"theta{i}"].values
         
-    # Resample to unweighted if needed? 
-    # pyabc SMC particles have weights (usually uniform in final generation if using acceptance threshold, but SMC uses importance weights)
-    # Let's resample to get equal-weighted samples for plotting consistency
-    print("Resampling W2-ABC posterior...")
+    print(f"Resampling {metric_name}-ABC posterior...")
     indices = np.random.choice(len(df), size=n_samples, p=w/w.sum(), replace=True)
     final_samples = samples[indices]
     
-    print(f"W2-ABC Completed. Max t={history.max_t}")
+    print(f"{metric_name}-ABC Completed. Max t={history.max_t}")
     
     return final_samples
+
+# Backward compatibility wrapper
+def run_w2abc(task, x_obs, n_samples=1000, max_populations=10, result_dir="results"):
+    return run_smc_abc(task, x_obs, n_samples, max_populations, result_dir, distance_metric="w2")

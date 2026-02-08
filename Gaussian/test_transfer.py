@@ -17,6 +17,7 @@ from scipy.stats import multivariate_normal
 from data_generation import GaussianTask, d, d_x, n
 from load_models import load_bayesflow_model, load_torch_model
 from utilities import refine_posterior
+from models.w2abc import run_smc_abc
 
 # ==========================================
 # Hyperparameters
@@ -28,7 +29,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 RESULT_DIR = "results/transfer_test"
 
 # ==========================================
-# Transfer Task Definition
+# Transfer Task Definition (Vague to Informative)
 # ==========================================
 
 class TransferGaussianTask(GaussianTask):
@@ -91,6 +92,64 @@ class TransferGaussianTask(GaussianTask):
             
             log_probs[valid] += log_const - 0.5 * resid**2
             
+        if not is_batch:
+            return log_probs[0]
+        return log_probs
+
+# ==========================================
+# Out-of-Sample Task Definition
+# ==========================================
+
+class OutOfSampleGaussianTask(GaussianTask):
+    """
+    Gaussian Task with Out-of-Sample Prior:
+    theta_0, theta_1 ~ Uniform[3, 6]
+    theta_2, theta_3 ~ Uniform[-3, 3]
+    theta_4 ~ Uniform[-3, 3]
+    """
+    def __init__(self, n=n):
+        super().__init__(n=n, prior_type='out_of_sample')
+        # Define bounds
+        self.lower = np.array([3.0, 3.0, -3.0, -3.0, -3.0])
+        self.upper = np.array([6.0, 6.0, 3.0, 3.0, 3.0])
+
+    def sample_prior(self, batch_size):
+        theta = np.zeros((batch_size, self.d), dtype=np.float32)
+        
+        # theta 0, 1: [3, 6]
+        theta[:, 0] = np.random.uniform(3, 6, batch_size)
+        theta[:, 1] = np.random.uniform(3, 6, batch_size)
+        
+        # theta 2, 3: [-3, 3]
+        theta[:, 2] = np.random.uniform(-3, 3, batch_size)
+        theta[:, 3] = np.random.uniform(-3, 3, batch_size)
+        
+        # theta 4: [-3, 3]
+        theta[:, 4] = np.random.uniform(-3, 3, batch_size)
+        
+        return theta
+
+    def log_prior(self, theta):
+        theta = np.asarray(theta)
+        is_batch = theta.ndim > 1
+        if not is_batch:
+            theta = theta[np.newaxis, :]
+            
+        log_probs = np.zeros(theta.shape[0], dtype=np.float32)
+        
+        mask = np.ones(theta.shape[0], dtype=bool)
+        
+        # Check bounds
+        mask &= (theta[:, 0] >= 3.0) & (theta[:, 0] <= 6.0)
+        mask &= (theta[:, 1] >= 3.0) & (theta[:, 1] <= 6.0)
+        mask &= (theta[:, 2] >= -3.0) & (theta[:, 2] <= 3.0)
+        mask &= (theta[:, 3] >= -3.0) & (theta[:, 3] <= 3.0)
+        mask &= (theta[:, 4] >= -3.0) & (theta[:, 4] <= 3.0)
+        
+        log_probs[~mask] = -np.inf
+        # Uniform log prob is constant (0 or -log(vol)), often ignored or handled by bounds in MCMC
+        # But we return 0 for valid, -inf for invalid is enough for Metropolis
+        
         if not is_batch:
             return log_probs[0]
         return log_probs
@@ -182,6 +241,63 @@ def run_pymc_transfer(obs_xs_2d, n_draws=2000, n_tune=2000, chains=20):
         print(f"PyMC Finished. Samples shape: {flat_samples.shape}")
         return flat_samples
 
+def run_pymc_out_of_sample(obs_xs_2d, n_draws=2000, n_tune=2000, chains=20):
+    """
+    Run PyMC with the Out-of-Sample Prior.
+    obs_xs_2d: (n, 2)
+    """
+    print(f"Setting up PyMC Out-of-Sample model...")
+    
+    with pm.Model() as model:
+        # 1. Priors
+        # theta_0, theta_1 ~ Uniform[3, 6]
+        t0 = pm.Uniform("t0", lower=3.0, upper=6.0)
+        t1 = pm.Uniform("t1", lower=3.0, upper=6.0)
+        
+        # theta_2, theta_3 ~ Uniform[-3, 3]
+        t2 = pm.Uniform("t2", lower=-3.0, upper=3.0)
+        t3 = pm.Uniform("t3", lower=-3.0, upper=3.0)
+        
+        # theta_4 ~ Uniform[-3, 3]
+        t4 = pm.Uniform("t4", lower=-3.0, upper=3.0)
+        
+        # 2. Transformations for Likelihood
+        s0_real = t2**2
+        s1_real = t3**2
+        rho = pm.math.tanh(t4)
+        
+        # 3. Construct Covariance Matrix
+        cov_00 = s0_real**2
+        cov_01 = rho * s0_real * s1_real
+        cov_11 = s1_real**2
+        
+        cov = pt.stack([
+            pt.stack([cov_00, cov_01]),
+            pt.stack([cov_01, cov_11])
+        ])
+        
+        mu = pt.stack([t0, t1])
+        
+        # 4. Likelihood
+        obs = pm.MvNormal("obs", mu=mu, cov=cov, observed=obs_xs_2d)
+        
+        # 5. Sampling
+        print("Starting PyMC sampling (Out-of-Sample)...")
+        trace = pm.sample(draws=n_draws, tune=n_tune, chains=chains, progressbar=True)
+        
+        # 6. Extract samples
+        post = trace.posterior
+        t0_s = post['t0'].values.flatten()
+        t1_s = post['t1'].values.flatten()
+        t2_s = post['t2'].values.flatten()
+        t3_s = post['t3'].values.flatten()
+        t4_s = post['t4'].values.flatten()
+        
+        flat_samples = np.stack([t0_s, t1_s, t2_s, t3_s, t4_s], axis=1)
+        
+        print(f"PyMC Finished. Samples shape: {flat_samples.shape}")
+        return flat_samples
+
 def plot_comparison(true_samples, model_samples_dict, theta_true, save_path):
     """
     Plot marginals comparing True Posterior vs Model Posteriors.
@@ -220,17 +336,11 @@ def plot_comparison(true_samples, model_samples_dict, theta_true, save_path):
 # Main Test Function
 # ==========================================
 
-def main():
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    
-    print(f"=== Starting Transfer Test (Round {LOAD_ROUND_ID}) ===")
+def run_vague_to_informative():
+    print(f"\n=== Starting Experiment 1: Vague to Informative (Round {LOAD_ROUND_ID}) ===")
     
     # 1. Generate Data with Transfer Task
     task = TransferGaussianTask(n=n)
-    
-    # Get Ground Truth (Fixed)
-    # theta_true_batch = task.sample_prior(1)
-    # theta_true = theta_true_batch[0]
     
     # Use fixed theta as requested
     theta_true = np.array([1.0, 1.0, -1.0, -0.9, 0.6], dtype=np.float32)
@@ -308,7 +418,7 @@ def main():
                 task, # Passing TransferGaussianTask
                 n_chains=1000,
                 n_samples=1,
-                burn_in=99,
+                burn_in=100,
                 thin=1,
                 nsims=50,
                 device=str(DEVICE)
@@ -324,10 +434,76 @@ def main():
             
     # 4. Plot Comparison
     if model_results:
-        save_path = os.path.join(RESULT_DIR, f"comparison_round_{LOAD_ROUND_ID}.png")
+        save_path = os.path.join(RESULT_DIR, f"comparison_vague_to_informative.png")
         plot_comparison(true_samples, model_results, theta_true, save_path)
     else:
         print("No model results to plot.")
+
+def run_out_of_sample_experiment():
+    print(f"\n=== Starting Experiment 2: Out of Sample (Round {LOAD_ROUND_ID}) ===")
+    
+    # 1. Generate Data with Out-of-Sample Task
+    task = OutOfSampleGaussianTask(n=n)
+    
+    # Fixed Theta (Out of Sample)
+    theta_true = np.array([5.0, 5.0, -1.0, -0.9, 0.6], dtype=np.float32)
+    theta_true_batch = theta_true[np.newaxis, :]
+    
+    # Generate observation
+    x_obs_3d = task.simulator(theta_true_batch)[0] # (n, 3)
+    
+    print(f"Ground Truth Theta: {theta_true}")
+    
+    # 2. Get True Posterior (PyMC with Out-of-Sample Prior)
+    # Convert to 2D for PyMC
+    x_obs_2d = inverse_stereo_proj(x_obs_3d[np.newaxis, ...])[0] # (n, 2)
+    
+    true_samples = run_pymc_out_of_sample(x_obs_2d, n_draws=N_SAMPLES, chains=20)
+    
+    model_results = {}
+    
+    # 3. Test Summary Network with SMC-ABC
+    # Load Summary Network
+    # We use the BayesFlow model's summary network
+    try:
+        model = load_bayesflow_model(LOAD_ROUND_ID)
+        summary_net = model.summary_network
+        
+        # Run SMC-ABC with Summary Distance
+        # n_samples=2000, max_populations=10
+        smc_samples = run_smc_abc(
+            task=task,
+            x_obs=x_obs_3d,
+            n_samples=2000, # Use smaller pop for speed in test
+            max_populations=10,
+            result_dir=os.path.join(RESULT_DIR, "smc_temp"),
+            distance_metric="summary",
+            summary_network=summary_net,
+            device=str(DEVICE)
+        )
+        
+        model_results["SMC_Summary"] = smc_samples
+        
+    except Exception as e:
+        print(f"Error in SMC-ABC: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # 4. Plot Comparison
+    if model_results:
+        save_path = os.path.join(RESULT_DIR, f"comparison_out_of_sample.png")
+        plot_comparison(true_samples, model_results, theta_true, save_path)
+    else:
+        print("No model results to plot.")
+
+def main():
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    
+    # Experiment 1: Vague to Informative (Transfer)
+    run_vague_to_informative()
+    
+    # Experiment 2: Out of Sample
+    run_out_of_sample_experiment()
 
 if __name__ == "__main__":
     main()
