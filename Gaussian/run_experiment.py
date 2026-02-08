@@ -166,31 +166,8 @@ def train_bayesflow(train_loader, epochs, device):
         
     print("Starting training (BayesFlow with Keras Loop)...")
     
-    # Build model (ensure it's created on the correct device)
-    # Keras 3 with Torch backend creates weights on the default torch device or current device context
-    if device.type == "cuda":
-        # Use context manager to ensure parameters are initialized on GPU
-        print(f"Initializing BayesFlow model on {device}...")
-        with torch.device(device):
-             amortized_posterior = build_bayesflow_model(d, d_x, summary_dim=10)
-    else:
-        # For MPS/CPU, standard build is usually fine, but explicit doesn't hurt
-        amortized_posterior = build_bayesflow_model(d, d_x, summary_dim=10)
-    
-    # Verify device placement (optional check)
-    try:
-        # Access a weight to check device
-        # Note: Keras 3 weights might need .value to get the tensor
-        if hasattr(amortized_posterior, "summary_network") and hasattr(amortized_posterior.summary_network, "weights") and len(amortized_posterior.summary_network.weights) > 0:
-            first_weight = amortized_posterior.summary_network.weights[0]
-            if hasattr(first_weight, "value"):
-                w_device = first_weight.value.device
-            else:
-                w_device = first_weight.device
-            print(f"Model weights initialized on: {w_device}")
-    except Exception as e:
-        # This is just a check, don't fail if it doesn't work (e.g. weights not yet created)
-        pass
+    # Build model
+    amortized_posterior = build_bayesflow_model(d, d_x, summary_dim=10)
     
     # Manual build (one forward pass) to initialize weights
     try:
@@ -333,7 +310,10 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
         loss_history, training_time = train_smmd_mmd(model, train_loader, epochs, device, model_type="mmd")
     elif model_type == "bayesflow":
         if BAYESFLOW_AVAILABLE:
-            model, loss_history, training_time = train_bayesflow(train_loader, epochs, device)
+            # Force CPU for BayesFlow to avoid MPS/Standardization issues
+            bf_device = torch.device("cpu")
+            print("Forcing BayesFlow to use CPU to avoid MPS/Keras compatibility issues.")
+            model, loss_history, training_time = train_bayesflow(train_loader, epochs, bf_device)
         else:
             print("BayesFlow unavailable, skipping.")
             return None
@@ -479,6 +459,19 @@ def save_model(model, model_type, round_id):
                  print(f"Saved BayesFlow weights to {save_dir}/round_{round_id}.weights.h5")
              except Exception as e2:
                  print(f"Failed to save BayesFlow weights: {e2}")
+                 
+                 # Fallback: Save sub-networks explicitly
+                 print("Attempting to save sub-networks (summary_network, inference_network)...")
+                 try:
+                     if hasattr(model, "summary_network"):
+                         model.summary_network.save_weights(f"{save_dir}/round_{round_id}_summary.weights.h5")
+                         print(f"Saved Summary Network weights to {save_dir}/round_{round_id}_summary.weights.h5")
+                     
+                     if hasattr(model, "inference_network"):
+                         model.inference_network.save_weights(f"{save_dir}/round_{round_id}_inference.weights.h5")
+                         print(f"Saved Inference Network weights to {save_dir}/round_{round_id}_inference.weights.h5")
+                 except Exception as e3:
+                     print(f"Failed to save sub-networks: {e3}")
     elif isinstance(model, torch.nn.Module):
         torch.save(model.state_dict(), filename)
         print(f"Saved {model_type} model to {filename}")
@@ -549,7 +542,7 @@ def main():
             print(f"Inverted 3D obs to 2D for PyMC. Shape: {x_obs_2d.shape}")
             
             # Reduce draws/tune slightly for speed in multi-round (optional, keeping high for quality)
-            pymc_samples = run_pymc(x_obs_2d, n_draws=2000, n_tune=3000, chains=20)
+            pymc_samples = run_pymc(x_obs_2d, n_draws=2500, n_tune=3000, chains=20)
             print(f"PyMC Samples Shape: {pymc_samples.shape}")
             plot_posterior(pymc_samples, theta_true, "PyMC_Reference", round_id=round_idx)
             
@@ -621,21 +614,34 @@ def main():
     
     # 4. Summary Statistics
     print("\n=== Experiment Summary ===")
-    df = pd.DataFrame(all_results)
-    
-    # Calculate Mean and Median
-    # Group by model_name
-    summary_mean = df.groupby("model_name").mean(numeric_only=True).drop(columns=["round"])
-    summary_median = df.groupby("model_name").median(numeric_only=True).drop(columns=["round"])
-    
-    print("Mean Metrics:")
-    print(summary_mean)
-    print("\nMedian Metrics:")
-    print(summary_median)
-    
-    # Save Summary
-    summary_mean.to_csv("results/summary_mean.csv")
-    summary_median.to_csv("results/summary_median.csv")
+    if not all_results:
+        print("Warning: No results to summarize.")
+    else:
+        df = pd.DataFrame(all_results)
+        
+        # Calculate Mean and Median
+        if "model_name" in df.columns:
+            summary_mean = df.groupby("model_name").mean(numeric_only=True)
+            summary_median = df.groupby("model_name").median(numeric_only=True)
+            
+            # Drop 'round' column if present in summary (it's averaged, so maybe not useful)
+            if "round" in summary_mean.columns:
+                summary_mean = summary_mean.drop(columns=["round"])
+            if "round" in summary_median.columns:
+                summary_median = summary_median.drop(columns=["round"])
+            
+            print("Mean Metrics:")
+            print(summary_mean)
+            print("\nMedian Metrics:")
+            print(summary_median)
+            
+            # Save Summary
+            os.makedirs("results", exist_ok=True)
+            summary_mean.to_csv("results/summary_mean.csv")
+            summary_median.to_csv("results/summary_median.csv")
+        else:
+            print("Error: 'model_name' column missing in results DataFrame.")
+            print(df.head())
     
     print("\nAll Experiments Completed. Results saved to 'results/' directory.")
 

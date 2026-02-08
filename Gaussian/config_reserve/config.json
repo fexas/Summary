@@ -1,0 +1,18 @@
+{
+    "n_observation": 50,
+    "num_rounds": 5,
+    "models_to_run": [
+        "smmd",
+        "mmd",
+        "bayesflow",
+        "dnnabc",
+        "w2abc"
+    ],
+    "models_config": {
+        "smmd": 150,
+        "mmd": 150,
+        "bayesflow": 20,
+        "dnnabc": 150,
+        "w2abc": 0
+    }
+}

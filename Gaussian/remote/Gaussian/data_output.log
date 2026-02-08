@@ -1,0 +1,12 @@
+Using Prior Configuration: weak_informative
+{'bounds_limit': 6.0, 'cond_noise_std': 0.1, 'mcmc_step': 0.07}
+--- Starting Iteration 0 ---
+Generated and saved obs_xs_0.npy
+Running MCMC for iteration 0...
+MCMC Step Size (h): 0.07
+Acceptance rate: 0.2207
+Saved posterior samples to ps_0.npy
+Posterior plot saved to data/posterior_plot_0.png
+Iteration 0 h_mmd: 12.398269653320312
+Iteration 0 data generation complete. Duration: 705.90 seconds (11.77 minutes).
+

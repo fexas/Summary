@@ -1,0 +1,15 @@
+#!/bin/bash
+###Use queue (partition) q2
+#SBATCH -p q2
+### Use 1 nodes and 52 cores
+#SBATCH -N 1 -n 52
+#SBATCH --output=gs_output.log
+#SBATCH --error=gs_error.log
+
+
+cd ${HOME}/SummaryLearning/Gaussian
+export conda_env=${HOME}/anaconda3/envs/SummaryLearning
+export PATH=${conda_env}/bin:${HOME}/anaconda3/condabin:${PATH}
+export LD_LIBRARY_PATH=${conda_env}/lib
+
+python run_experiment.py

@@ -1,0 +1,33 @@
+INFO:bayesflow:Using backend 'torch'
+WARNING:bayesflow:
+When using torch backend, we need to disable autograd by default to avoid excessive memory usage. Use
+
+with torch.enable_grad():
+    ...
+
+in contexts where you need gradients (e.g. custom training loops).
+INFO:arviz.preview:arviz_base not installed
+INFO:arviz.preview:arviz_stats not installed
+INFO:arviz.preview:arviz_plots not installed
+INFO:pymc.sampling.mcmc:Initializing NUTS using jitter+adapt_diag...
+INFO:pymc.sampling.mcmc:Multiprocess sampling (20 chains in 4 jobs)
+INFO:pymc.sampling.mcmc:NUTS: [theta]
+INFO:pymc.sampling.mcmc:Sampling 20 chains for 3_000 tune and 2_000 draw iterations (60_000 + 40_000 draws total) took 49 seconds.
+INFO:pymc.stats.convergence:The rhat statistic is larger than 1.01 for some parameters. This indicates problems during sampling. See https://arxiv.org/abs/1903.08008 for details
+ERROR:pymc.stats.convergence:The effective sample size per chain is smaller than 100 for some parameters.  A higher number is needed for reliable rhat and ess computation. See https://arxiv.org/abs/1903.08008 for details
+Sampling:   0%|          | 0/1 [00:00<?, ?batch/s]Sampling: 100%|██████████| 1/1 [00:00<00:00, 12.71batch/s]
+Sampling:   0%|          | 0/1 [00:00<?, ?batch/s]Sampling: 100%|██████████| 1/1 [00:00<00:00, 13.17batch/s]
+Traceback (most recent call last):
+  File "/mnt/beegfs/rlico/SummaryLearning/Gaussian/run_experiment.py", line 427, in <module>
+    main()
+  File "/mnt/beegfs/rlico/SummaryLearning/Gaussian/run_experiment.py", line 422, in main
+    run_single_experiment(model_type, task, train_loader, theta_true, x_obs, epochs=epochs, device=DEVICE)
+  File "/mnt/beegfs/rlico/SummaryLearning/Gaussian/run_experiment.py", line 323, in run_single_experiment
+    refined_samples = refine_posterior(
+  File "/mnt/beegfs/rlico/SummaryLearning/Gaussian/utilities.py", line 233, in refine_posterior
+    return refine_posterior_bayesflow(model, *args, **kwargs)
+  File "/mnt/beegfs/rlico/SummaryLearning/Gaussian/utilities.py", line 205, in refine_posterior_bayesflow
+    epsilon = compute_bandwidth_bayesflow(model, x_obs, task, device=device)
+  File "/mnt/beegfs/rlico/SummaryLearning/Gaussian/utilities.py", line 193, in compute_bandwidth_bayesflow
+    Theta0_np = Theta0_np.reshape(n_samples, -1)
+AttributeError: 'dict' object has no attribute 'reshape'
