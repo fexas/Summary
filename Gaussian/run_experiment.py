@@ -447,8 +447,6 @@ def save_model(model, model_type, round_id):
     filename = f"{save_dir}/round_{round_id}.pt"
     
     if model_type == "bayesflow":
-        # Save BayesFlow (Keras) model
-        # Note: Keras 3 saving might be different
         try:
              model.save(f"{save_dir}/round_{round_id}.keras")
              print(f"Saved BayesFlow model to {save_dir}/round_{round_id}.keras")
@@ -460,18 +458,26 @@ def save_model(model, model_type, round_id):
              except Exception as e2:
                  print(f"Failed to save BayesFlow weights: {e2}")
                  
-                 # Fallback: Save sub-networks explicitly
-                 print("Attempting to save sub-networks (summary_network, inference_network)...")
                  try:
                      if hasattr(model, "summary_network"):
                          model.summary_network.save_weights(f"{save_dir}/round_{round_id}_summary.weights.h5")
                          print(f"Saved Summary Network weights to {save_dir}/round_{round_id}_summary.weights.h5")
-                     
-                     if hasattr(model, "inference_network"):
-                         model.inference_network.save_weights(f"{save_dir}/round_{round_id}_inference.weights.h5")
-                         print(f"Saved Inference Network weights to {save_dir}/round_{round_id}_inference.weights.h5")
                  except Exception as e3:
-                     print(f"Failed to save sub-networks: {e3}")
+                     print(f"Failed to save Summary Network weights: {e3}")
+                 
+                 try:
+                     if hasattr(model, "inference_network"):
+                         dummy_x = torch.zeros((1, n, d_x), dtype=torch.float32)
+                         x_emb = model.summary_network(dummy_x)
+                         dummy_theta = torch.zeros((1, d), dtype=torch.float32)
+                         if hasattr(model.inference_network, "log_prob"):
+                             _ = model.inference_network.log_prob(dummy_theta, conditions=x_emb)
+                         else:
+                             _ = model.inference_network(dummy_theta, conditions=x_emb)
+                         torch.save(model.inference_network.state_dict(), f"{save_dir}/round_{round_id}_inference.pt")
+                         print(f"Saved Inference Network state_dict to {save_dir}/round_{round_id}_inference.pt")
+                 except Exception as e4:
+                     print(f"Failed to save Inference Network state_dict: {e4}")
     elif isinstance(model, torch.nn.Module):
         torch.save(model.state_dict(), filename)
         print(f"Saved {model_type} model to {filename}")

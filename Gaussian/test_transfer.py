@@ -1,15 +1,22 @@
 
 import os
+
+# Set Keras Backend to Torch BEFORE importing keras/bayesflow
+os.environ["KERAS_BACKEND"] = "torch"
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import pymc as pm
+import pytensor.tensor as pt
+import arviz as az
 from scipy.stats import multivariate_normal
 
 # Local imports
 from data_generation import GaussianTask, d, d_x, n
 from load_models import load_bayesflow_model, load_torch_model
-# from utilities import refine_posterior # Optional: if we want to test refinement
+from utilities import refine_posterior
 
 # ==========================================
 # Hyperparameters
@@ -19,6 +26,74 @@ MODELS_TO_TEST = ["bayesflow"]  # Options: "smmd", "mmd", "bayesflow"
 N_SAMPLES = 2000
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 RESULT_DIR = "results/transfer_test"
+
+# ==========================================
+# Transfer Task Definition
+# ==========================================
+
+class TransferGaussianTask(GaussianTask):
+    """
+    Gaussian Task with Transfer Prior:
+    theta_0, theta_2, theta_3, theta_4 ~ Uniform[-3, 3]
+    theta_1 ~ N(theta_0^2, 0.1^2)
+    """
+    def __init__(self, n=n):
+        super().__init__(n=n, prior_type='transfer')
+        # Expand bounds for theta 1 to accommodate theta_0^2 (up to 9)
+        # We keep other bounds at [-3, 3]
+        self.lower = np.array([-3.0, -2.0, -3.0, -3.0, -3.0]) 
+        self.upper = np.array([3.0, 15.0, 3.0, 3.0, 3.0])
+
+    def sample_prior(self, batch_size):
+        # 1. Sample Uniform parameters
+        # Initialize with zeros
+        theta = np.zeros((batch_size, self.d), dtype=np.float32)
+        
+        # Indices 0, 2, 3, 4 are Uniform[-3, 3]
+        for i in [0, 2, 3, 4]:
+            theta[:, i] = np.random.uniform(-3, 3, batch_size)
+            
+        # 2. Sample theta_1 | theta_0
+        # theta_1 ~ N(theta_0^2, 0.1^2)
+        mean_1 = theta[:, 0]**2
+        std_1 = 0.1
+        theta[:, 1] = np.random.normal(mean_1, std_1)
+        
+        return theta
+
+    def log_prior(self, theta):
+        theta = np.asarray(theta)
+        is_batch = theta.ndim > 1
+        if not is_batch:
+            theta = theta[np.newaxis, :]
+            
+        log_probs = np.zeros(theta.shape[0], dtype=np.float32)
+        
+        # 1. Check bounds for Uniform parameters
+        mask_uniform = np.ones(theta.shape[0], dtype=bool)
+        for i in [0, 2, 3, 4]:
+            mask_uniform &= (theta[:, i] >= -3.0) & (theta[:, i] <= 3.0)
+            
+        log_probs[~mask_uniform] = -np.inf
+        
+        # 2. Add log prob for theta_1 (Normal)
+        # Only for valid uniform samples
+        valid = mask_uniform
+        if np.any(valid):
+            t0 = theta[valid, 0]
+            t1 = theta[valid, 1]
+            
+            # Log PDF of Normal(mu=t0^2, sigma=0.1)
+            # log p = -0.5 * log(2*pi*sigma^2) - 0.5 * ((x - mu)/sigma)^2
+            sigma = 0.1
+            log_const = -0.5 * np.log(2 * np.pi * sigma**2)
+            resid = (t1 - t0**2) / sigma
+            
+            log_probs[valid] += log_const - 0.5 * resid**2
+            
+        if not is_batch:
+            return log_probs[0]
+        return log_probs
 
 # ==========================================
 # Helper Functions
@@ -42,82 +117,70 @@ def inverse_stereo_proj(x_3d):
     
     return np.stack([x_2d, y_2d], axis=-1)
 
-def exact_log_likelihood(theta, x_2d):
+def run_pymc_transfer(obs_xs_2d, n_draws=2000, n_tune=2000, chains=20):
     """
-    Compute exact log likelihood of 2D data under Gaussian Model.
-    theta: (d,)
-    x_2d: (n, 2)
+    Run PyMC with the Transfer Prior.
+    obs_xs_2d: (n, 2)
     """
-    m0, m1 = theta[0], theta[1]
-    # theta[2] and theta[3] are squared to get variance in simulator?
-    # Based on data_generation.py: xs[..., 0] = s0 * us[..., 0] + m0 where s0 = theta[:, 2:3] ** 2
-    # So the standard deviation is theta[2]**2
-    std0 = theta[2]**2
-    std1 = theta[3]**2
-    r_param = theta[4]
-    corr = np.tanh(r_param)
+    print(f"Setting up PyMC Transfer model...")
     
-    cov = np.array([
-        [std0**2, std0*std1*corr],
-        [std0*std1*corr, std1**2]
-    ])
-    
-    mean = np.array([m0, m1])
-    
-    try:
-        log_prob = multivariate_normal.logpdf(x_2d, mean=mean, cov=cov)
-        return np.sum(log_prob)
-    except np.linalg.LinAlgError:
-        return -np.inf
-
-def run_true_mcmc(x_obs, task, n_samples=2000, burn_in=500, thin=1):
-    """
-    Run MCMC to get True Posterior samples using Exact Likelihood.
-    """
-    print("Running MCMC for True Posterior...")
-    x_2d = inverse_stereo_proj(x_obs)[0] # (n, 2)
-    
-    current_theta = task.sample_prior(1).flatten() # Start from prior
-    
-    samples = []
-    accepted = 0
-    
-    # Adaptive proposal
-    proposal_cov = np.eye(task.d) * 0.1
-    
-    for i in range(n_samples * thin + burn_in):
-        # Propose new theta
-        proposal = np.random.multivariate_normal(current_theta, proposal_cov)
+    with pm.Model() as model:
+        # 1. Priors
+        # t0, t2, t3, t4 ~ U[-3, 3]
+        t0 = pm.Uniform("t0", lower=-3.0, upper=3.0)
+        t2 = pm.Uniform("t2", lower=-3.0, upper=3.0)
+        t3 = pm.Uniform("t3", lower=-3.0, upper=3.0)
+        t4 = pm.Uniform("t4", lower=-3.0, upper=3.0)
         
-        # Check prior support
-        if np.any(np.abs(proposal) > 3.0): # Assuming prior is roughly uniform/Gaussian within bounds, simplified check
-             # Actually prior is Uniform[-3, 3] usually in this task, or Gaussian(0,1). 
-             # data_generation.py: return np.random.uniform(-3, 3, (batch_size, self.d))
-             prior_ratio = 0 # Out of bounds
-        else:
-             prior_ratio = 1 # Uniform prior
+        # t1 ~ N(t0^2, 0.1)
+        t1 = pm.Normal("t1", mu=t0**2, sigma=0.1)
         
-        if prior_ratio == 0:
-            accept_prob = 0
-        else:
-            log_lik_curr = exact_log_likelihood(current_theta, x_2d)
-            log_lik_prop = exact_log_likelihood(proposal, x_2d)
-            
-            if log_lik_prop == -np.inf:
-                accept_prob = 0
-            else:
-                accept_prob = np.exp(log_lik_prop - log_lik_curr)
+        # Stack into a single tensor for easier handling if needed, 
+        # but we use individual variables for likelihood construction
         
-        if np.random.rand() < accept_prob:
-            current_theta = proposal
-            if i >= burn_in:
-                accepted += 1
+        # 2. Transformations for Likelihood
+        # s0 = theta[2]**2, s1 = theta[3]**2
+        s0_real = t2**2
+        s1_real = t3**2
         
-        if i >= burn_in and (i - burn_in) % thin == 0:
-            samples.append(current_theta)
-            
-    print(f"MCMC Finished. Acceptance Rate: {accepted / (n_samples * thin):.2f}")
-    return np.array(samples)
+        # r = tanh(theta[4])
+        rho = pm.math.tanh(t4)
+        
+        # 3. Construct Covariance Matrix
+        # Sigma = [[s0_real**2, rho * s0_real * s1_real],
+        #          [rho * s0_real * s1_real, s1_real**2]]
+        
+        cov_00 = s0_real**2
+        cov_01 = rho * s0_real * s1_real
+        cov_11 = s1_real**2
+        
+        cov = pt.stack([
+            pt.stack([cov_00, cov_01]),
+            pt.stack([cov_01, cov_11])
+        ])
+        
+        mu = pt.stack([t0, t1])
+        
+        # 4. Likelihood
+        obs = pm.MvNormal("obs", mu=mu, cov=cov, observed=obs_xs_2d)
+        
+        # 5. Sampling
+        print("Starting PyMC sampling (Transfer)...")
+        trace = pm.sample(draws=n_draws, tune=n_tune, chains=chains, progressbar=True)
+        
+        # 6. Extract samples
+        # Extract individual variables and stack
+        post = trace.posterior
+        t0_s = post['t0'].values.flatten()
+        t1_s = post['t1'].values.flatten()
+        t2_s = post['t2'].values.flatten()
+        t3_s = post['t3'].values.flatten()
+        t4_s = post['t4'].values.flatten()
+        
+        flat_samples = np.stack([t0_s, t1_s, t2_s, t3_s, t4_s], axis=1)
+        
+        print(f"PyMC Finished. Samples shape: {flat_samples.shape}")
+        return flat_samples
 
 def plot_comparison(true_samples, model_samples_dict, theta_true, save_path):
     """
@@ -162,15 +225,27 @@ def main():
     
     print(f"=== Starting Transfer Test (Round {LOAD_ROUND_ID}) ===")
     
-    # 1. Generate Data
-    task = GaussianTask(n=n)
-    theta_true, x_obs = task.get_ground_truth()
+    # 1. Generate Data with Transfer Task
+    task = TransferGaussianTask(n=n)
     
-    # x_obs is (1, n, d_x)
+    # Get Ground Truth (Fixed)
+    # theta_true_batch = task.sample_prior(1)
+    # theta_true = theta_true_batch[0]
+    
+    # Use fixed theta as requested
+    theta_true = np.array([1.0, 1.0, -1.0, -0.9, 0.6], dtype=np.float32)
+    theta_true_batch = theta_true[np.newaxis, :]
+    
+    # Generate observation
+    x_obs_3d = task.simulator(theta_true_batch)[0] # (n, 3)
+    
     print(f"Ground Truth Theta: {theta_true}")
     
-    # 2. Get True Posterior (MCMC)
-    true_samples = run_true_mcmc(x_obs, task, n_samples=N_SAMPLES)
+    # 2. Get True Posterior (PyMC with Transfer Prior)
+    # Convert to 2D for PyMC
+    x_obs_2d = inverse_stereo_proj(x_obs_3d[np.newaxis, ...])[0] # (n, 2)
+    
+    true_samples = run_pymc_transfer(x_obs_2d, n_draws=N_SAMPLES)
     
     model_results = {}
     
@@ -184,49 +259,63 @@ def main():
             else:
                 model = load_torch_model(model_name, LOAD_ROUND_ID, device=DEVICE)
             
-            # Inference
-            print("Sampling...")
-            samples = None
+            # --- Amortized Inference ---
+            print("Sampling Amortized...")
+            samples_amortized = None
             
             if model_name == "bayesflow":
                 # BayesFlow Sampling
-                # Prepare conditions
-                if isinstance(x_obs, torch.Tensor):
-                     x_obs_cpu = x_obs.detach().cpu().numpy()
+                if isinstance(x_obs_3d, torch.Tensor):
+                     x_obs_cpu = x_obs_3d.detach().cpu().numpy()
                 else:
-                     x_obs_cpu = np.asarray(x_obs)
+                     x_obs_cpu = np.asarray(x_obs_3d)
                 
-                # Ensure batch dim
                 if x_obs_cpu.ndim == 2:
                     x_obs_cpu = x_obs_cpu[np.newaxis, ...]
                     
                 conditions = {"summary_variables": x_obs_cpu}
                 
-                # Sample
                 out = model.sample(conditions=conditions, num_samples=N_SAMPLES)
                 if isinstance(out, dict):
-                    samples = out["inference_variables"]
+                    samples_amortized = out["inference_variables"]
                 else:
-                    samples = out
+                    samples_amortized = out
                     
-                samples = samples.reshape(-1, d)
+                samples_amortized = samples_amortized.reshape(-1, d)
                 
             else:
-                # PyTorch Models (SMMD, MMD)
-                # Ensure torch tensor
-                if isinstance(x_obs, np.ndarray):
-                    x_obs_torch = torch.from_numpy(x_obs).float().to(DEVICE)
+                # PyTorch Models
+                if isinstance(x_obs_3d, np.ndarray):
+                    x_obs_torch = torch.from_numpy(x_obs_3d).float().to(DEVICE)
                 else:
-                    x_obs_torch = x_obs.to(DEVICE)
+                    x_obs_torch = x_obs_3d.to(DEVICE)
                 
                 if x_obs_torch.ndim == 2:
                     x_obs_torch = x_obs_torch.unsqueeze(0)
                     
-                samples = model.sample_posterior(x_obs_torch, N_SAMPLES)
-                samples = samples.detach().cpu().numpy().reshape(-1, d)
+                samples_amortized = model.sample_posterior(x_obs_torch, N_SAMPLES)
+                samples_amortized = samples_amortized.detach().cpu().numpy().reshape(-1, d)
             
-            model_results[model_name] = samples
-            print(f"Got {samples.shape[0]} samples from {model_name}")
+            model_results[f"{model_name}_amortized"] = samples_amortized
+            
+            # --- Refinement with Transfer Prior ---
+            print(f"Refining {model_name} with Transfer Prior...")
+            
+            # Use the TransferGaussianTask instance 'task' which has the correct log_prior
+            refined_samples = refine_posterior(
+                model, 
+                x_obs_3d, 
+                task, # Passing TransferGaussianTask
+                n_chains=1000,
+                n_samples=1,
+                burn_in=99,
+                thin=1,
+                nsims=50,
+                device=str(DEVICE)
+            )
+            
+            refined_samples_flat = refined_samples.reshape(-1, d)
+            model_results[f"{model_name}_refined"] = refined_samples_flat
             
         except Exception as e:
             print(f"Error testing {model_name}: {e}")

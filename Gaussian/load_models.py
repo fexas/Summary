@@ -65,10 +65,10 @@ def load_bayesflow_model(round_id, save_dir="saved_models/bayesflow", summary_di
     else:
         print(f"Full weights file not found at {weights_path}")
 
-    # Fallback: Try loading sub-network weights if full load failed or file missing
     print("Attempting to load sub-network weights...")
     summary_path = os.path.join(save_dir, f"round_{round_id}_summary.weights.h5")
-    inference_path = os.path.join(save_dir, f"round_{round_id}_inference.weights.h5")
+    inference_path_h5 = os.path.join(save_dir, f"round_{round_id}_inference.weights.h5")
+    inference_path_pt = os.path.join(save_dir, f"round_{round_id}_inference.pt")
     
     if os.path.exists(summary_path):
         try:
@@ -77,12 +77,18 @@ def load_bayesflow_model(round_id, save_dir="saved_models/bayesflow", summary_di
         except Exception as e:
             print(f"Failed to load Summary Network weights: {e}")
     
-    if os.path.exists(inference_path):
+    if os.path.exists(inference_path_pt):
         try:
-            model.inference_network.load_weights(inference_path)
-            print("Loaded Inference Network weights.")
+            model.inference_network.load_state_dict(torch.load(inference_path_pt, map_location="cpu"))
+            print("Loaded Inference Network state_dict.")
         except Exception as e:
-            print(f"Failed to load Inference Network weights: {e}")
+            print(f"Failed to load Inference Network state_dict: {e}")
+    elif os.path.exists(inference_path_h5):
+        try:
+            model.inference_network.load_weights(inference_path_h5)
+            print("Loaded Inference Network weights (h5).")
+        except Exception as e:
+            print(f"Failed to load Inference Network weights (h5): {e}")
             
     return model
 
