@@ -47,9 +47,7 @@ class ToNumpy(Transform):
     def inverse(self, data, **kwargs):
         """
         Inverse transform: Identity.
-        BayesFlow calls this during sampling. Since we just converted to numpy for the network,
-        the output from the network is already compatible or will be handled by the user.
-        We just return the data as is.
+        BayesFlow calls this during sampling.
         """
         return data
 

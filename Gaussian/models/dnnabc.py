@@ -88,12 +88,6 @@ def abc_rejection_sampling(model, x_obs, task, n_samples=1000, batch_size=10000,
     # But usually ABC-Rejection with learned summary stats works by:
     # Simulating N (large) samples, computing distances, taking top k (n_samples).
     
-    # Heuristic: Simulate 100 * n_samples? Or fixed budget?
-    # User said: "used for plotting ... quantity similar to others" (e.g. 1000).
-    # Rejection rate is usually low.
-    # Let's simulate a large pool, say 100,000 or 1,000,000?
-    # 100,000 might be enough if the summary statistic is good.
-    
     N_POOL = 100000
     
     all_thetas = []

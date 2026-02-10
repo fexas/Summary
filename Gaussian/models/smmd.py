@@ -179,7 +179,7 @@ def sliced_mmd_loss(theta_true, theta_fake, num_slices=20, n_points=50):
     
     # 2. Compute MMD on projections (using Gaussian Kernel)
     # Bandwidth
-    bandwidth = 1.0 / (2.0 * n_points)
+    bandwidth = 1.0 / (1.0 * n_points)
     
     # Diff matrices: (batch, M, M, L) or (batch, 1, M, L) etc.
     # To compute efficiently:

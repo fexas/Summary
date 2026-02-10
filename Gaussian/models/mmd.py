@@ -20,7 +20,7 @@ def mmd_loss(theta_true, theta_fake, n_points=50):
     # bandwidth = tf.constant([1 / n, 4 / n, 9 / n, 16 / n, 25 / n], "float32")
     # coefficient = bandwidth ** (d / 2) -> 1/coefficient
     
-    bandwidths = torch.tensor([20.0/n_points], device=device)
+    bandwidths = torch.tensor([4.0/n_points, 9.0/n_points, 16.0/n_points], device=device)
     # Reshape for broadcasting: (K, 1, 1, 1) where K is number of kernels
     bandwidths = bandwidths.view(-1, 1, 1, 1)
     

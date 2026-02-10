@@ -32,6 +32,7 @@ from models.mmd import MMD_Model, mmd_loss
 from models.bayesflow_net import build_bayesflow_model
 from models.dnnabc import DNNABC_Model, train_dnnabc, abc_rejection_sampling
 from models.w2abc import run_w2abc
+from models.sbi_wrappers import run_sbi_model
 from utilities import refine_posterior, compute_bandwidth_torch, compute_mmd_metric
 from pymc_sampler import run_pymc
 
@@ -244,19 +245,22 @@ def train_bayesflow(train_loader, epochs, device):
     return amortized_posterior, loss_history, training_time
 
 def plot_loss(loss_history, title="Training Loss", round_id=0):
+    output_dir = f"results/plots/round_{round_id}/loss"
+    os.makedirs(output_dir, exist_ok=True)
     plt.figure(figsize=(10, 5))
     plt.plot(loss_history)
     plt.title(f"{title} (Round {round_id})")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.grid(True)
-    plt.savefig(f"results/loss_{title.lower().replace(' ', '_')}_round{round_id}.png")
+    plt.savefig(f"{output_dir}/{title.lower().replace(' ', '_')}.png")
     plt.close()
 
-def plot_posterior(theta_samples, theta_true, method_name, round_id=0):
+def plot_posterior(theta_samples, theta_true, output_dir, filename="posterior.png"):
     """
     Plots the marginal posterior for each of the 5 dimensions in a single row.
     """
+    os.makedirs(output_dir, exist_ok=True)
     num_params = theta_samples.shape[1]
     # Ensure we have at least 5 dimensions or plot all available
     cols = num_params
@@ -284,7 +288,79 @@ def plot_posterior(theta_samples, theta_true, method_name, round_id=0):
         ax.grid(True, alpha=0.3)
         
     plt.tight_layout()
-    plt.savefig(f"results/posterior_{method_name.lower().replace(' ', '_')}_round{round_id}.png")
+    plt.savefig(os.path.join(output_dir, filename))
+    plt.close()
+
+def plot_combined_posteriors(all_model_samples, theta_true, output_dir, filename="combined_posteriors.png"):
+    """
+    Plots posteriors from multiple models on one figure.
+    all_model_samples: dict {model_name: samples}
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    if not all_model_samples:
+        return
+
+    num_params = next(iter(all_model_samples.values())).shape[1]
+    cols = num_params
+    
+    fig, axes = plt.subplots(1, cols, figsize=(5 * cols, 5))
+    if cols == 1: axes = [axes]
+    
+    for i in range(cols):
+        ax = axes[i]
+        param_name = f'theta{i+1}'
+        
+        for model_name, samples in all_model_samples.items():
+            if samples is not None:
+                sns.kdeplot(x=samples[:, i], label=model_name.upper(), ax=ax, alpha=0.3, fill=False, linewidth=2)
+            
+        if i < len(theta_true):
+            ax.axvline(x=theta_true[i], color='black', linestyle='--', linewidth=2, label='True')
+            
+        ax.set_title(f'Marginal {param_name}')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, filename))
+    plt.close()
+
+def plot_refinement_comparison(samples_dict, theta_true, output_dir, model_name):
+    """
+    Plots Amortized vs Refined for a single model.
+    samples_dict: { 'Amortized': samples, 'Refined': samples }
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    filename = f"{model_name}_refinement_comparison.png"
+    
+    # Check if we have samples
+    valid_samples = [s for s in samples_dict.values() if s is not None]
+    if not valid_samples:
+        return
+
+    num_params = valid_samples[0].shape[1]
+    cols = num_params
+    
+    fig, axes = plt.subplots(1, cols, figsize=(5 * cols, 5))
+    if cols == 1: axes = [axes]
+    
+    for i in range(cols):
+        ax = axes[i]
+        param_name = f'theta{i+1}'
+        
+        for label, samples in samples_dict.items():
+            if samples is not None:
+                sns.kdeplot(x=samples[:, i], label=label, ax=ax, alpha=0.3, fill=True)
+            
+        if i < len(theta_true):
+            ax.axvline(x=theta_true[i], color='black', linestyle='--', linewidth=2, label='True')
+            
+        ax.set_title(f'{model_name.upper()} - {param_name}')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, filename))
     plt.close()
 
 def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, round_id, epochs=30, device=DEVICE, n_obs=n):
@@ -320,13 +396,27 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
     elif model_type == "dnnabc":
         model = DNNABC_Model(d=d, d_x=d_x, n_points=n_obs)
         # We treat this as training time, but for final logging we only care about "total time"
-        # However, to be consistent with others, we can track it. 
-        # But user instruction says: "如果是dnnabc和w2则只需要记录整体的时间即可"
-        # So we will sum up later.
         loss_history = train_dnnabc(model, train_loader, epochs, device)
     elif model_type == "w2abc":
         print("W2-ABC does not require neural network training. Proceeding to inference...")
         loss_history = []
+    elif model_type == "snpe_a":
+        # SNPE-A runs training and sampling together
+        # Get sbi_rounds from global config if available, else default to 2
+        sbi_rounds = config.get("sbi_rounds", 2) if "config" in globals() else 2
+        
+        posterior_samples = run_sbi_model(
+            model_type="snpe_a",
+            train_loader=None, # SBI generates its own simulations
+            x_obs=x_obs,
+            theta_true=theta_true,
+            task=task,
+            device=str(device), # sbi expects string or torch.device
+            num_rounds=sbi_rounds,
+            sims_per_round=1000,
+            max_epochs=epochs
+        )
+        loss_history = [] # SBI wrapper doesn't return loss history yet
             
     if loss_history:
         plot_loss(loss_history, title=f"{model_type.upper()} Loss", round_id=round_id)
@@ -341,6 +431,9 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
         # W2ABC does inference via SMC, which takes time
         posterior_samples = run_w2abc(task, x_obs, n_samples=n_samples, max_populations=2) 
         model = "W2ABC_SMC_Sampler" # Placeholder
+    elif model_type == "snpe_a":
+        # Already sampled in training step
+        pass
     elif model_type == "dnnabc":
         # DNNABC does ABC rejection sampling using trained summary net
         posterior_samples = abc_rejection_sampling(model, x_obs, task, n_samples=n_samples, device=device)
@@ -383,12 +476,14 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
     np.save(f"{save_dir_samples}/amortized.npy", posterior_samples)
     print(f"Saved amortized samples to {save_dir_samples}/amortized.npy")
     
-    plot_posterior(posterior_samples, theta_true, f"{model_type}_Amortized", round_id=round_id)
+    # Plot Amortized Posterior
+    plot_dir = f"results/plots/round_{round_id}/{model_type}"
+    plot_posterior(posterior_samples, theta_true, plot_dir, "amortized_posterior.png")
     
     # 3. Local Refinement
     refined_samples_flat = None
     
-    if model_type in ["dnnabc", "w2abc"]:
+    if model_type in ["dnnabc", "w2abc", "snpe_a"]:
         print(f"--- Skipping Local Refinement for {model_type} (as requested) ---")
         refined_samples_flat = posterior_samples # Use amortized/SMC samples as final
         
@@ -426,7 +521,15 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
         np.save(f"{save_dir_samples}/refined.npy", refined_samples_flat)
         print(f"Saved refined samples to {save_dir_samples}/refined.npy")
         
-        plot_posterior(refined_samples_flat, theta_true, f"{model_type}_Refined", round_id=round_id)
+        # Plot Refined Posterior
+        plot_posterior(refined_samples_flat, theta_true, plot_dir, "refined_posterior.png")
+        
+        # Plot Comparison (Amortized vs Refined)
+        samples_comp = {
+            "Amortized": posterior_samples,
+            "Refined": refined_samples_flat
+        }
+        plot_refinement_comparison(samples_comp, theta_true, plot_dir, model_type)
         
         total_time = training_time + refinement_time # Though for these we log separately
     
@@ -548,9 +651,10 @@ def main():
             print(f"Inverted 3D obs to 2D for PyMC. Shape: {x_obs_2d.shape}")
             
             # Reduce draws/tune slightly for speed in multi-round (optional, keeping high for quality)
-            pymc_samples = run_pymc(x_obs_2d, n_draws=2500, n_tune=3000, chains=20)
+            pymc_samples = run_pymc(x_obs_2d, n_draws=2000, n_tune=3000, chains=30)
             print(f"PyMC Samples Shape: {pymc_samples.shape}")
-            plot_posterior(pymc_samples, theta_true, "PyMC_Reference", round_id=round_idx)
+            pymc_plot_dir = f"results/plots/round_{round_idx}/pymc"
+            plot_posterior(pymc_samples, theta_true, pymc_plot_dir, "posterior.png")
             
             # Save PyMC Samples
             pymc_save_dir = f"results/posterior_samples/pymc_reference/round_{round_idx}"
@@ -564,6 +668,11 @@ def main():
     
         # 3. Run Experiments
         print("\n=== Step 3: Run Model Experiments ===")
+        
+        # Collect samples for combined plot
+        round_samples_for_plot = {}
+        if pymc_samples is not None:
+            round_samples_for_plot["PyMC"] = pymc_samples
         
         current_models_to_run = MODELS_TO_RUN
         if isinstance(current_models_to_run, str):
@@ -582,6 +691,10 @@ def main():
             
             if result is None:
                 continue
+            
+            # Collect amortized samples for combined plot
+            if result["amortized_samples"] is not None:
+                round_samples_for_plot[model_type] = result["amortized_samples"]
                 
             # Compute MMD Metrics
             mmd_amortized = 0.0
@@ -617,6 +730,11 @@ def main():
             
             # Save CSV incrementally (optional, but good for safety)
             pd.DataFrame(all_results).to_csv("results/experiment_results.csv", index=False)
+            
+        # End of Model Loop - Plot Combined Posteriors
+        print(f"Generating combined posterior plot for Round {round_idx}...")
+        combined_plot_dir = f"results/plots/round_{round_idx}"
+        plot_combined_posteriors(round_samples_for_plot, theta_true, combined_plot_dir, "combined_posteriors.png")
     
     # 4. Summary Statistics
     print("\n=== Experiment Summary ===")
