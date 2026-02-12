@@ -1,13 +1,15 @@
 
 import torch
 import torch.nn as nn
+import numpy as np
 from models.smmd import SMMD_Model
 
-def mmd_loss(theta_true, theta_fake, n_points=50, weights=None):
+def mmd_loss(theta_true, theta_fake, bandwidths=None, n_time_steps=151, weights=None):
     """
     Compute Maximum Mean Discrepancy (MMD) with Gaussian Kernel.
     theta_true: (batch, d)
     theta_fake: (batch, M, d)
+    bandwidths: (K,) or list of floats. If None, defaults based on n_time_steps.
     """
     batch_size, M, dim = theta_fake.shape
     device = theta_fake.device
@@ -20,9 +22,20 @@ def mmd_loss(theta_true, theta_fake, n_points=50, weights=None):
     # bandwidth = tf.constant([1 / n, 4 / n, 9 / n, 16 / n, 25 / n], "float32")
     # coefficient = bandwidth ** (d / 2) -> 1/coefficient
     
-    bandwidths = torch.tensor([4.0/n_points, 9.0/n_points, 16.0/n_points], device=device)
+    if bandwidths is None:
+        bandwidths = torch.tensor([50.0 / n_time_steps], device=device)
+    elif not isinstance(bandwidths, torch.Tensor):
+        bandwidths = torch.tensor(bandwidths, device=device, dtype=torch.float32)
+    else:
+        bandwidths = bandwidths.to(device)
+        
     # Reshape for broadcasting: (K, 1, 1, 1) where K is number of kernels
     bandwidths = bandwidths.view(-1, 1, 1, 1)
+    
+    # Calculate normalization coefficients
+    # bandwidths is sigma^2.
+    # coef = (2 * pi * sigma^2)^(-d/2)
+    coefs = (2 * np.pi * bandwidths) ** (-dim / 2)
     
     # Expand Inputs
     # theta_true: (batch, 1, d)
@@ -42,16 +55,15 @@ def mmd_loss(theta_true, theta_fake, n_points=50, weights=None):
     
     # Apply Kernels
     # K_GG: (K, batch, M, M)
-    # Note: We sum kernels without normalization coefficients (like 1/sigma^d) 
-    # as is common in MMD implementations (e.g. the reference article).
-    K_GG = torch.exp(-0.5 * dist_sq_GG.unsqueeze(0) / bandwidths)
+    # Note: We sum kernels with normalization coefficients
+    K_GG = coefs * torch.exp(-0.5 * dist_sq_GG.unsqueeze(0) / bandwidths)
     
     # K_TT: (K, batch, 1, 1)
     # Since dist is 0, exp(0) = 1.
-    K_TT = torch.ones((bandwidths.shape[0], batch_size, 1, 1), device=device)
+    K_TT = coefs.expand(-1, batch_size, 1, 1)
     
     # K_GT: (K, batch, M, 1)
-    K_GT = torch.exp(-0.5 * dist_sq_GT.unsqueeze(0) / bandwidths)
+    K_GT = coefs * torch.exp(-0.5 * dist_sq_GT.unsqueeze(0) / bandwidths)
     
     # Sum over Kernels
     total_K_GG = torch.sum(K_GG, dim=0) # (batch, M, M)

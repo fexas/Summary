@@ -1,6 +1,7 @@
 
 import torch
 import torch.nn as nn
+import numpy as np
 
 class InvariantModule(nn.Module):
     def __init__(self, settings):
@@ -193,7 +194,7 @@ class SMMD_Model(nn.Module):
         
         return samples.cpu().numpy()
 
-def sliced_mmd_loss(theta_true, theta_fake, num_slices=20, n_points=50, weights=None):
+def sliced_mmd_loss(theta_true, theta_fake, num_slices=20, n_time_steps=151, weights=None):
     # theta_true: (batch, d) -> unsqueeze to (batch, 1, d)
     # theta_fake: (batch, M, d)
     
@@ -214,7 +215,7 @@ def sliced_mmd_loss(theta_true, theta_fake, num_slices=20, n_points=50, weights=
     
     # 2. Compute MMD on projections (using Gaussian Kernel)
     # Bandwidth
-    bandwidth = 5.0 / (1.0 * n_points)
+    bandwidth = 10.0 / (1.0 * n_time_steps)
     
     # Diff matrices: (batch, M, M, L) or (batch, 1, M, L) etc.
     # To compute efficiently:
@@ -240,6 +241,120 @@ def sliced_mmd_loss(theta_true, theta_fake, num_slices=20, n_points=50, weights=
     
     if weights is not None:
         # weights: (batch,)
-        return torch.mean(loss * weights)
+        loss = torch.mean(loss * weights)
+    else:
+        loss = torch.mean(loss) # Mean over batch
+        
+    return loss
+
+def mixture_sliced_mmd_loss(theta_true, theta_fake, bandwidths=None, num_slices=20, n_time_steps=151, weights=None):
+    """
+    Mixture Bandwidth Sliced MMD Loss.
     
-    return torch.mean(loss) # Mean over batch
+    Args:
+        theta_true: (batch, d) Ground truth parameters
+        theta_fake: (batch, M, d) Simulated parameters
+        bandwidths: (K,) or list of floats. Bandwidths (sigma^2) for the kernel.
+                    If None, defaults to [5.0/n_time_steps, 15.0/n_time_steps].
+        num_slices: int, number of random slices
+        n_time_steps: int, number of time steps (used for default bandwidths)
+        weights: (batch,) Optional weights for importance sampling
+        
+    Returns:
+        loss: scalar tensor
+    """
+    # theta_true: (batch, d) -> unsqueeze to (batch, 1, d)
+    # theta_fake: (batch, M, d)
+    
+    batch_size, M, dim = theta_fake.shape
+    device = theta_fake.device
+    
+    # Default bandwidths if not provided
+    if bandwidths is None:
+        bandwidths = [10.0 / n_time_steps, 20.0 / n_time_steps]
+    
+    # Ensure bandwidths is a tensor
+    if not isinstance(bandwidths, torch.Tensor):
+        bandwidths = torch.tensor(bandwidths, device=device, dtype=torch.float32)
+    else:
+        bandwidths = bandwidths.to(device)
+        
+    # bandwidths: (K,)
+    num_kernels = bandwidths.shape[0]
+    
+    # Coefficients for Gaussian Kernel normalization: 1 / sqrt(2 * pi * sigma^2)
+    # bandwidths here are treated as sigma^2 (variance), matching the existing code's usage
+    # where exp(-0.5 * dist^2 / bandwidth).
+    # So sigma = sqrt(bandwidth).
+    # coef = 1 / (sqrt(2*pi) * sigma) = 1 / sqrt(2*pi*bandwidth)
+    coefs = 1.0 / torch.sqrt(2 * np.pi * bandwidths) # (K,)
+    
+    # Reshape for broadcasting: (1, 1, 1, 1, K) or similar depending on dimensions
+    
+    # 1. Random Projections
+    # (dim, L)
+    unit_vectors = torch.randn(dim, num_slices, device=device)
+    unit_vectors = unit_vectors / torch.norm(unit_vectors, dim=0, keepdim=True)
+    
+    # Projections
+    # theta_true: (batch, 1, d) @ (d, L) -> (batch, 1, L)
+    proj_T = torch.matmul(theta_true.unsqueeze(1), unit_vectors)
+    
+    # theta_fake: (batch, M, d) @ (d, L) -> (batch, M, L)
+    proj_G = torch.matmul(theta_fake, unit_vectors)
+    
+    # 2. Compute Mixture MMD
+    
+    # G vs G
+    # (batch, M, 1, L) - (batch, 1, M, L) -> (batch, M, M, L)
+    diff_GG = proj_G.unsqueeze(2) - proj_G.unsqueeze(1)
+    diff_sq_GG = diff_GG.pow(2)
+    
+    # Compute mixture kernel
+    # Expand dims manually for broadcasting optimization
+    # diff_sq_GG: (batch, M, M, L)
+    # bandwidths: (K,)
+    
+    # (batch, M, M, L, 1)
+    d_GG = diff_sq_GG.unsqueeze(-1)
+    # (1, 1, 1, 1, K)
+    b_view = bandwidths.view(1, 1, 1, 1, num_kernels)
+    c_view = coefs.view(1, 1, 1, 1, num_kernels)
+    
+    # (batch, M, M, L, K)
+    K_GG_all = c_view * torch.exp(-0.5 * d_GG / b_view)
+    
+    # Mean over samples (M, M), slices (L), and kernels (K)
+    loss_GG = torch.mean(K_GG_all, dim=(1, 2, 3, 4)) # (batch,)
+    
+    # T vs T
+    # diff is 0. Kernel is 1.0 * coef.
+    # Mixture is mean(coefs)
+    loss_TT = torch.mean(coefs) # Scalar (broadcasts to batch)
+    
+    # G vs T
+    # (batch, M, L) - (batch, 1, L) -> (batch, M, L)
+    diff_GT = proj_G - proj_T
+    diff_sq_GT = diff_GT.pow(2) # (batch, M, L)
+    
+    # (batch, M, L, 1)
+    d_GT = diff_sq_GT.unsqueeze(-1)
+    # (1, 1, 1, K)
+    b_view_GT = bandwidths.view(1, 1, 1, num_kernels)
+    c_view_GT = coefs.view(1, 1, 1, num_kernels)
+    
+    # (batch, M, L, K)
+    K_GT_all = c_view_GT * torch.exp(-0.5 * d_GT / b_view_GT)
+    
+    # Mean over M, L, and K
+    loss_GT = torch.mean(K_GT_all, dim=(1, 2, 3)) # (batch,)
+    
+    # MMD Loss
+    loss = loss_GG + loss_TT - 2 * loss_GT
+    
+    if weights is not None:
+        loss = torch.mean(loss * weights)
+    else:
+        loss = torch.mean(loss)
+        
+    return loss

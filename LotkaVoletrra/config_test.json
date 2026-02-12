@@ -1,0 +1,25 @@
+{
+    "dataset_size": 100,
+    "val_size": 20,
+    "batch_size": 10,
+    "num_rounds": 1,
+    "models_to_run": ["smmd", "bayesflow"],
+    "models_config": {
+        "smmd": {
+            "epochs": 100,
+            "num_refine_rounds": 1,
+            "refined_mode": 1,
+            "mcmc_burn_in": 1
+        },
+        "bayesflow": {
+            "epochs": 30,
+            "num_refine_rounds": 1,
+            "refined_mode": 1,
+            "mcmc_burn_in": 1
+        }
+    },
+    "learning_rate": 1e-3,
+    "n_samples_posterior": 10,
+    "n_time_steps": 21,
+    "dt": 0.2
+}

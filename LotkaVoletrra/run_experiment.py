@@ -28,7 +28,7 @@ import keras
 
 # Import from local modules
 from data_generation import LVTask
-from models.smmd import SMMD_Model, sliced_mmd_loss
+from models.smmd import SMMD_Model, sliced_mmd_loss, mixture_sliced_mmd_loss
 from models.mmd import MMD_Model, mmd_loss
 from models.bayesflow_net import build_bayesflow_model
 from models.dnnabc import DNNABC_Model, train_dnnabc, abc_rejection_sampling
@@ -108,7 +108,12 @@ def get_scheduler(optimizer, epochs):
 # 2. Training Loops
 # ============================================================================
 
-def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd"):
+from scipy.stats import gaussian_kde
+
+# L1 Penalty Factor
+L1_LAMBDA = 1e-4
+
+def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd", n_time_steps=151):
     """Training loop for SMMD and MMD models."""
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = get_scheduler(optimizer, epochs)
@@ -141,11 +146,19 @@ def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd"):
                 
                 # Compute Loss
                 if model_type == "smmd":
-                    loss = sliced_mmd_loss(theta_batch, theta_fake, num_slices=L, n_points=M, weights=weights_batch)
+                    # Mixture Sliced MMD Loss (default bandwidths handled internally: [5.0/n_time_steps, 15.0/n_time_steps])
+                    loss = mixture_sliced_mmd_loss(theta_batch, theta_fake, num_slices=L, n_time_steps=n_time_steps, weights=weights_batch)
                 elif model_type == "mmd":
-                    loss = mmd_loss(theta_batch, theta_fake, n_points=M, weights=weights_batch)
+                    loss = mmd_loss(theta_batch, theta_fake, n_time_steps=n_time_steps, weights=weights_batch)
                 else:
                     raise ValueError(f"Unknown model type: {model_type}")
+                
+                # Add L1 Penalty to Generator weights only
+                if hasattr(model, 'G'):
+                    l1_loss = 0.0
+                    for param in model.G.parameters():
+                        l1_loss += torch.sum(torch.abs(param))
+                    loss = loss + L1_LAMBDA * l1_loss
                 
                 loss.backward()
                 optimizer.step()
@@ -364,11 +377,11 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
     if model_type == "smmd":
         summary_dim = model_config.get("summary_dim", 10)
         model = SMMD_Model(summary_dim=summary_dim, d=d, d_x=d_x, n=n_obs_curr)
-        loss_history, training_time = train_smmd_mmd(model, train_loader, epochs, DEVICE, "smmd")
+        loss_history, training_time = train_smmd_mmd(model, train_loader, epochs, DEVICE, "smmd", n_time_steps=n_obs_curr)
     elif model_type == "mmd":
         summary_dim = model_config.get("summary_dim", 10)
         model = MMD_Model(summary_dim=summary_dim, d=d, d_x=d_x, n=n_obs_curr)
-        loss_history, training_time = train_smmd_mmd(model, train_loader, epochs, DEVICE, "mmd")
+        loss_history, training_time = train_smmd_mmd(model, train_loader, epochs, DEVICE, "mmd", n_time_steps=n_obs_curr)
     elif model_type == "bayesflow":
         if BAYESFLOW_AVAILABLE:
             bf_device = torch.device("cpu") # Force CPU for Keras
@@ -395,7 +408,7 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
     if model_type == "w2abc":
         max_populations = model_config.get("max_populations", 2)
         posterior_samples = run_w2abc(task, x_obs, n_samples=n_samples, max_populations=max_populations)
-    elif model_type in ["snpe_a", "snpe_b", "npe"]:
+    elif model_type in ["snpe_a", "snpe_b", "npe", "snpe", "snpe_c"]:
         num_rounds = model_config.get("sbi_rounds", 1)
         sims_per_round = model_config.get("sims_per_round", 1000)
         max_epochs = model_config.get("epochs", 1000)
@@ -461,9 +474,12 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
         torch.save(model.state_dict(), f"{save_model_dir}/initial_state_dict.pt")
         
     # ========================================================================
-    # 5. Refined+ (Sequential Training) - Only for SMMD/MMD
+    # 5. Refined+ (Sequential Training) - SMMD/MMD/BayesFlow
     # ========================================================================
-    run_refined_training = model_type in ["smmd", "mmd"]
+    run_refined_training = model_type in ["smmd", "mmd", "bayesflow"]
+    
+    # Store theta_init for MCMC
+    theta_init_mcmc = None
     
     if run_refined_training:
         print(f"\n--- Starting Refined+ Training for {model_type} ---")
@@ -482,150 +498,200 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
                 print(f"Refined+ Mode is 0. Skipping Refined+ training.")
                 break
                 
-            print(f"Refined+ Mode: {refined_mode}")
+            # Mode 1 (New Standard): 50% Posterior + 50% Prior -> Unweighted Training -> Weighted Resampling
+            N_new = DATASET_SIZE
+            print(f"1. Sampling {N_new} parameters from current posterior...")
             
-            theta_combined = None
-            x_combined = None
-            weights_combined = None
+            theta_new = None
+            if model_type == "bayesflow":
+                # BayesFlow sampling
+                x_obs_cpu = x_obs if isinstance(x_obs, np.ndarray) else x_obs.cpu().numpy()
+                if x_obs_cpu.ndim == 2: x_obs_cpu = x_obs_cpu[np.newaxis, ...]
+                x_obs_rep = np.tile(x_obs_cpu, (N_new, 1, 1))
+                post = model.sample(conditions={"summary_variables": x_obs_rep}, num_samples=1)
+                if isinstance(post, dict): post = post["inference_variables"]
+                theta_new = post.reshape(N_new, -1)
+            elif hasattr(model, "sample_posterior"):
+                theta_new = model.sample_posterior(x_obs, N_new)
+                
+            if isinstance(theta_new, torch.Tensor):
+                theta_new = theta_new.cpu().numpy()
             
-            if refined_mode == 1:
-                # Mode 1: 50% Posterior, 50% Prior (Original)
-                N_new = DATASET_SIZE
-                print(f"1. Sampling {N_new} parameters from current posterior (Mode 1)...")
-                
-                theta_new = None
-                if hasattr(model, "sample_posterior"):
-                    theta_new = model.sample_posterior(x_obs, N_new)
-                    if isinstance(theta_new, torch.Tensor):
-                        theta_new = theta_new.cpu().numpy()
-                
-                if theta_new is None:
-                    print("Failed to sample for Refined+. Skipping.")
-                    continue
-                    
-                print(f"2. Simulating new data (N={N_new})...")
-                x_new = task.simulator(theta_new)
-                
-                print("3. Calculating weights (Mode 1)...")
-                
-                # Fit KDE on theta_new
-                log_kde_new = fit_kde_and_evaluate(theta_new, theta_new) # log q(theta)
-                kde_prob_new = np.exp(log_kde_new)
-                
-                # Prior prob
-                log_prior_new = task.log_prior(theta_new)
-                prior_prob_new = np.exp(log_prior_new)
-                
-                # Weights for NEW data
-                # Denominator: 0.5 * KDE + 0.5 * Prior
-                denom_new = 0.5 * kde_prob_new + 0.5 * prior_prob_new
-                weights_new = prior_prob_new / (denom_new + 1e-10)
-                
-                # Weights for OLD data (from Prior)
-                print(f"   Reusing previous training data...")
-                # Extract from train_loader
-                if hasattr(train_loader.dataset, 'tensors'):
-                    x_old = train_loader.dataset.tensors[0].numpy()
-                    theta_old = train_loader.dataset.tensors[1].numpy()
-                else:
-                    # Fallback if not TensorDataset or other structure
-                    print("Warning: Could not extract data from loader. Resampling from prior.")
-                    theta_old = task.sample_prior(N_new, "vague")
-                    x_old = task.simulator(theta_old)
-                
-                log_kde_old = fit_kde_and_evaluate(theta_new, theta_old) 
-                kde_prob_old = np.exp(log_kde_old)
-                
-                prior_prob_old = np.exp(task.log_prior(theta_old))
-                denom_old = 0.5 * kde_prob_old + 0.5 * prior_prob_old
-                weights_old = prior_prob_old / (denom_old + 1e-10)
-                
-                # Combine
-                theta_combined = np.concatenate([theta_old, theta_new], axis=0)
-                x_combined = np.concatenate([x_old, x_new], axis=0)
-                weights_combined = np.concatenate([weights_old, weights_new], axis=0)
-                
-            elif refined_mode == 2:
-                # Mode 2: 100% Posterior
-                N_new = DATASET_SIZE
-                print(f"1. Sampling {N_new} parameters from current posterior (Mode 2)...")
-                
-                theta_new = None
-                if hasattr(model, "sample_posterior"):
-                    theta_new = model.sample_posterior(x_obs, N_new)
-                    if isinstance(theta_new, torch.Tensor):
-                        theta_new = theta_new.cpu().numpy()
-                        
-                if theta_new is None:
-                    print("Failed to sample for Refined+. Skipping.")
-                    continue
-                    
-                print(f"2. Simulating new data (N={N_new})...")
-                x_new = task.simulator(theta_new)
-                
-                print("3. Calculating weights (Mode 2)...")
-                
-                # Fit KDE on theta_new
-                log_kde_new = fit_kde_and_evaluate(theta_new, theta_new)
-                kde_prob_new = np.exp(log_kde_new)
-                
-                log_prior_new = task.log_prior(theta_new)
-                prior_prob_new = np.exp(log_prior_new)
-                
-                # Weights = p(theta) / q(theta)
-                weights_new = prior_prob_new / (kde_prob_new + 1e-10)
-                
-                theta_combined = theta_new
-                x_combined = x_new
-                weights_combined = weights_new
-                
-            else:
-                print(f"Unknown refined_mode: {refined_mode}. Skipping Refined+ round.")
+            if theta_new is None:
+                print("Failed to sample for Refined+. Skipping.")
                 continue
+                
+            print(f"2. Simulating new data (N={N_new})...")
+            # Sample from q_train (initial trained model)
+            theta_new = None
+            if model_type == "bayesflow":
+                x_obs_cpu = x_obs if isinstance(x_obs, np.ndarray) else x_obs.cpu().numpy()
+                if x_obs_cpu.ndim == 2: x_obs_cpu = x_obs_cpu[np.newaxis, ...]
+                x_obs_rep = np.tile(x_obs_cpu, (N_new, 1, 1))
+                post = model.sample(conditions={"summary_variables": x_obs_rep}, num_samples=1)
+                if isinstance(post, dict): post = post["inference_variables"]
+                theta_new = post.reshape(N_new, -1)
+            elif hasattr(model, "sample_posterior"):
+                theta_new = model.sample_posterior(x_obs, N_new)
+                
+            if isinstance(theta_new, torch.Tensor):
+                theta_new = theta_new.cpu().numpy()
+                
+            if theta_new is None:
+                print("Failed to sample from q_train for Refined+. Skipping.")
+                continue
+
+            # Simulate x from q_train
+            x_new = task.simulator(theta_new)
             
-            # Normalize weights
-            weights_combined = weights_combined / np.mean(weights_combined)
+            # Prior Data (Reuse old training data)
+            print(f"3. Sampling {N_new} parameters from prior (reusing original training data)...")
+            # Reuse original training data (theta_train, x_train)
+            # Need to ensure N_new matches or we subsample/repeat
+            # train_loader has the data. Let's extract it or use the variables from main loop if passed.
+            # But run_single_experiment takes train_loader.
+            # We can iterate train_loader to get all data.
             
-            print(f"   Combined Dataset: {len(theta_combined)} samples. Weights Mean: {np.mean(weights_combined):.4f}")
+            theta_old_list = []
+            x_old_list = []
+            for batch in train_loader:
+                # batch is usually (x, theta) or (theta, x) depending on creation
+                # TensorDataset(x_train_tensor, theta_train_tensor)
+                # So batch[0] is x, batch[1] is theta
+                x_b, t_b = batch[0], batch[1]
+                theta_old_list.append(t_b)
+                x_old_list.append(x_b)
+            
+            theta_old = torch.cat(theta_old_list).numpy()
+            x_old = torch.cat(x_old_list).numpy()
+            
+            # Squeeze theta_old if necessary
+            # TensorDataset might wrap theta as (batch, d) or (batch, 1, d)
+            # We want (N, d)
+            if theta_old.ndim == 3 and theta_old.shape[1] == 1:
+                theta_old = theta_old.squeeze(1)
+                
+            # Check theta_new shape (should be (N, d))
+            if theta_new.ndim == 3 and theta_new.shape[1] == 1:
+                theta_new = theta_new.squeeze(1)
+            
+            # Print shapes for debug
+            print(f"   Shape Check: theta_old={theta_old.shape}, theta_new={theta_new.shape}")
+            print(f"   Shape Check: x_old={x_old.shape}, x_new={x_new.shape}")
+            
+            # If dataset size differs from N_new, adjust. 
+            # Usually N_new = N (dataset size).
+            if len(theta_old) != N_new:
+                # Subsample or repeat
+                indices = np.random.choice(len(theta_old), size=N_new, replace=True)
+                theta_old = theta_old[indices]
+                x_old = x_old[indices]
+
+            # Fit KDE on q_train samples (theta_new) for weight calculation later
+            # Wait, we need q_train(theta) density.
+            # We approximate q_train(theta) using KDE on theta_new (samples from q_train).
+            print("   Fitting KDE on q_train samples...")
+            log_kde_q_train = fit_kde_and_evaluate(theta_new, theta_new) # Fit on theta_new
+            # We need the KDE object to evaluate on FUTURE samples (theta_retrained).
+            # So we should refactor fit_kde_and_evaluate or just use scipy directly here.
+            kde_q_train_model = gaussian_kde(theta_new.T)
+            
+            # Combine
+            theta_combined = np.concatenate([theta_old, theta_new], axis=0)
+            x_combined = np.concatenate([x_old, x_new], axis=0)
+            
+            # No weights for training (Equation 1 in ReviseComment is sum of losses)
+            # We just create a dataset of 2N
+            print(f"   Combined Dataset: {len(theta_combined)} samples. (Unweighted for training)")
             
             # D. Retrain
-            print("4. Retraining with weighted dataset...")
+            print("4. Retraining on combined dataset...")
             ds_retrain = TensorDataset(
                 torch.from_numpy(x_combined).float(), 
-                torch.from_numpy(theta_combined).float(),
-                torch.from_numpy(weights_combined).float()
+                torch.from_numpy(theta_combined).float()
             )
             loader_retrain = DataLoader(ds_retrain, batch_size=BATCH_SIZE, shuffle=True)
             
-            loss_hist_retrain, time_retrain = train_smmd_mmd(model, loader_retrain, epochs=epochs, device=DEVICE, model_type=model_type)
+            if model_type == "bayesflow":
+                 # Retrain BayesFlow
+                 # Note: train_bayesflow returns (model, history, time)
+                 # We ignore the returned model since it updates in place (Keras)
+                 _, loss_hist_retrain, time_retrain = train_bayesflow(loader_retrain, epochs=epochs, device="cpu", summary_dim=model_config.get("summary_dim", 10))
+            else:
+                 loss_hist_retrain, time_retrain = train_smmd_mmd(model, loader_retrain, epochs=epochs, device=DEVICE, model_type=model_type)
+            
             print(f"   Retraining done in {time_retrain:.2f}s")
             
             timings["refined_plus"] += time_retrain
             
             # Save Retrained Model for this Refined+ Round
-            save_path = f"{save_model_dir}/sl_state_dict.pt"
-            torch.save(model.state_dict(), save_path)
-            print(f"   Saved model to {save_path}")
-            
-            # Sample Retrained Model
+            if model_type == "bayesflow":
+                 try:
+                     model.save_weights(f"{save_model_dir}/sl_round{refine_round_idx}.weights.h5")
+                 except:
+                     pass
+            else:
+                 torch.save(model.state_dict(), f"{save_model_dir}/sl_state_dict_round{refine_round_idx}.pt")
+
+            # Sample Retrained Model (Mixture Model)
             print(f"5. Sampling Retrained Model (Refined+ Round {refine_round_idx})...")
-            theta_retrained = model.sample_posterior(x_obs, n_samples)
+            
+            theta_retrained = None
+            if model_type == "bayesflow":
+                 x_obs_rep = np.tile(x_obs_cpu, (n_samples, 1, 1))
+                 post = model.sample(conditions={"summary_variables": x_obs_rep}, num_samples=1)
+                 if isinstance(post, dict): post = post["inference_variables"]
+                 theta_retrained = post.reshape(n_samples, -1)
+            elif hasattr(model, "sample_posterior"):
+                 theta_retrained = model.sample_posterior(x_obs, n_samples)
+                 
             if isinstance(theta_retrained, torch.Tensor):
                 theta_retrained = theta_retrained.cpu().numpy()
             
-            samples_dict["refined_plus"] = theta_retrained
+            # Calculate Weights for Resampling (to recover target posterior)
+            # w = prior / (0.5 * q_train + 0.5 * prior)
+            # Note: Denominator uses q_train (initial), NOT q_retrained!
+            print("6. Calculating weights for resampling...")
+            
+            # Evaluate q_train density on theta_retrained
+            # kde_q_train_model was fitted on theta_new (samples from q_train)
+            kde_prob_q_train = kde_q_train_model(theta_retrained.T)
+            
+            log_prior_retrained = task.log_prior(theta_retrained)
+            prior_prob_retrained = np.exp(log_prior_retrained)
+            
+            denom = 0.5 * kde_prob_q_train + 0.5 * prior_prob_retrained
+            weights_resample = prior_prob_retrained / (denom + 1e-10)
+            
+            # Handle NaNs or Infs
+            weights_resample = np.nan_to_num(weights_resample, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            sum_w = np.sum(weights_resample)
+            if sum_w < 1e-9:
+                print("Warning: Sum of weights is close to 0. Using uniform weights.")
+                weights_resample = np.ones_like(weights_resample) / len(weights_resample)
+            else:
+                weights_resample /= sum_w
+            
+            # Resample
+            indices = np.random.choice(len(theta_retrained), size=n_samples, replace=True, p=weights_resample)
+            theta_resampled = theta_retrained[indices]
+            
+            # Store for MCMC
+            theta_init_mcmc = theta_resampled
+            samples_dict["refined_plus"] = theta_resampled
                     
-            # Metrics Retrained
-            metrics_retrained = compute_metrics(theta_retrained, theta_true)
-            metrics_retrained["training_time"] = training_time + time_retrain # Accumulate? Ideally yes but simplified
+            # Metrics Retrained (Resampled)
+            metrics_retrained = compute_metrics(theta_resampled, theta_true)
+            metrics_retrained["training_time"] = training_time + time_retrain 
             metrics_retrained["stage"] = f"refined_round{refine_round_idx}"
-            print(f"   Retrained (Round {refine_round_idx}) Bias L2: {metrics_retrained['bias_l2']:.4f}")
+            print(f"   Retrained & Resampled (Round {refine_round_idx}) Bias L2: {metrics_retrained['bias_l2']:.4f}")
             
             # Save Samples & Plot
             refined_dir = f"results/models/{model_type}/round_{round_id}/refined_round_{refine_round_idx}"
             os.makedirs(refined_dir, exist_ok=True)
-            np.save(f"{refined_dir}/posterior_samples.npy", theta_retrained)
-            plot_posterior(theta_retrained, theta_true, refined_dir, "posterior_plot.png")
+            np.save(f"{refined_dir}/posterior_samples.npy", theta_resampled)
+            plot_posterior(theta_resampled, theta_true, refined_dir, "posterior_plot.png")
             
     # ========================================================================
             
@@ -654,7 +720,11 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
         # Pass n_chains=n_samples and n_samples=1 to get exactly n_samples
         # Pass device explicitly
         mcmc_burn_in = model_config.get("mcmc_burn_in", 29)
-        theta_mcmc = refine_posterior(model, x_obs, task=task, n_chains=n_samples, n_samples=1, burn_in=mcmc_burn_in, device=DEVICE) 
+        
+        # Pass theta_init_mcmc if available (from Refined+)
+        theta_mcmc = refine_posterior(model, x_obs, task=task, n_chains=n_samples, n_samples=1, 
+                                     burn_in=mcmc_burn_in, device=DEVICE, theta_init=theta_init_mcmc) 
+ 
         
         time_mcmc = time.time() - t_mcmc_start
         print(f"   ABC-MCMC done in {time_mcmc:.2f}s")
@@ -828,14 +898,19 @@ def main():
         print(f"Saved table for {model_name} to results/tables/{model_name}_results.csv")
             
         # Compute Summary Stats
-        bias_l2 = [r["bias_l2"] for r in rows]
-        hdi_length = [np.mean(r["hdi_length"]) for r in rows]
-        coverage = [np.mean(r["coverage"]) for r in rows]
+        success_rows = [r for r in rows if r.get("status", 0) == 1]
+        if not success_rows:
+            print(f"No successful runs for {model_name}")
+            continue
+            
+        bias_l2 = [r["bias_l2"] for r in success_rows]
+        hdi_length = [np.mean(r["hdi_length"]) for r in success_rows]
+        coverage = [np.mean(r["coverage"]) for r in success_rows]
         
         # Average Times
-        avg_sec_initial = np.mean([r["seconds_initial"] for r in rows])
-        avg_sec_sl = np.mean([r["seconds_refined_plus"] for r in rows])
-        avg_sec_mcmc = np.mean([r["seconds_mcmc"] for r in rows])
+        avg_sec_initial = np.mean([r["seconds_initial"] for r in success_rows])
+        avg_sec_sl = np.mean([r["seconds_refined_plus"] for r in success_rows])
+        avg_sec_mcmc = np.mean([r["seconds_mcmc"] for r in success_rows])
         
         mean_bias = np.mean(bias_l2)
         median_bias = np.median(bias_l2)

@@ -1,0 +1,52 @@
+{
+    "n_time_steps": 151,
+    "dt": 0.2,
+    "num_rounds": 100,
+    "dataset_size": 12800,
+    "val_size": 100,
+    "batch_size": 128,
+    "learning_rate": 0.001,
+    "n_samples_posterior": 1000,
+    "models_to_run": [
+        "smmd",
+        "mmd",
+        "bayesflow",
+        "dnnabc",
+        "npe"
+    ],
+    "models_config": {
+        "smmd": { 
+            "epochs": 500,
+            "summary_dim": 8,
+            "refined_mode": 1,
+            "num_refine_rounds": 1
+        },
+        "mmd": { 
+            "epochs": 500,
+            "summary_dim": 8,
+            "refined_mode": 1,
+            "num_refine_rounds": 1
+        },
+        "bayesflow": { 
+            "epochs": 500,
+            "summary_dim": 8,
+            "refined_mode": 1
+        },
+        "dnnabc": { 
+            "epochs": 500, 
+            "n_pool": 1000 
+        },
+        "w2abc": {
+            "max_populations": 2
+        },
+        "npe": { 
+            "sbi_rounds": 10,
+            "sims_per_round": 1000,
+            "epochs": 1000
+        }
+    },
+    "smmd_mmd_config": {
+        "M": 50,
+        "L": 20
+    }
+}

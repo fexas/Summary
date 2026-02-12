@@ -1,0 +1,2 @@
+round,status,stage,bias_l2,hdi_length,coverage,time_initial,time_refined_plus,time_mcmc,bias_vec,hdi_lower,hdi_upper,training_time,sampling_time
+1,1,initial,1.356028643085864,[0.39744806 0.96733546 1.0780708  0.9353161 ],[1. 0. 0. 0.],0:00:00,0:00:00,0:00:00,[-0.26238352  0.60780992 -0.74368894  0.92057722],[-4.9949436 -0.5578597 -1.2879592 -4.150729 ],[-4.5974956   0.4094757  -0.20988843 -3.215413  ],0.0,65.89391994476318

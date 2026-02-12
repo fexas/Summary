@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from sbi.inference import NPE_A, NPE_B, SNPE
+from sbi.inference import NPE_A, NPE_B, SNPE, NPE
 from sbi.utils import BoxUniform
 
 def calculate_summary_statistics(x):
@@ -121,18 +121,22 @@ def run_sbi_model(model_type, train_loader, x_obs, theta_true, task, device="cpu
     # We will respect the device passed, but fallback to cpu for safety if needed.
     device_sbi = "cpu" 
     
-    if model_type.lower() == 'snpe_a' or model_type.lower() == 'npe':
-        # Default to NPE_A as requested for 'npe' or 'snpe_a'
+    # Normalize model_type
+    model_type_lower = model_type.lower()
+    
+    if model_type_lower == 'snpe_a':
         inference = NPE_A(prior=prior, device=device_sbi)
-    elif model_type.lower() == 'snpe_b':
+    elif model_type_lower == 'snpe_b':
         inference = NPE_B(prior=prior, device=device_sbi)
-    elif model_type.lower() == 'snpe_c':
-        inference = SNPE(prior=prior, device=device_sbi)
+    elif model_type_lower in ['snpe_c', 'npe', 'snpe']:
+        # Use NPE (default SNPE-C / APT)
+        inference = NPE(prior=prior, device=device_sbi)
     else:
-        # Fallback to NPE_A
-        inference = NPE_A(prior=prior, device=device_sbi)
+        # Fallback to NPE (default)
+        print(f"Warning: Unknown model_type '{model_type}'. Defaulting to NPE (SNPE-C).")
+        inference = NPE(prior=prior, device=device_sbi)
 
-    # 3. Sequential Inference Loop (SNPE-A Style)
+    # 3. Sequential Inference Loop
     proposal = prior
     
     for r in range(num_rounds):
@@ -155,20 +159,24 @@ def run_sbi_model(model_type, train_loader, x_obs, theta_true, task, device="cpu
         x = x.to(device_sbi)
         
         # B. Train
-        # NPE-A trains a Gaussian density estimator in all but the last round.
-        # In the last round, it trains a mixture of Gaussians.
-        final_round = (r == num_rounds - 1)
+        # Prepare kwargs for train
+        train_kwargs = {"max_num_epochs": max_epochs}
+        
+        # NPE-A specific: trains a Gaussian density estimator in all but the last round.
+        if isinstance(inference, NPE_A):
+            final_round = (r == num_rounds - 1)
+            train_kwargs["final_round"] = final_round
         
         with torch.enable_grad():
             # append_simulations returns the inference object, then we call train
-            density_estimator = inference.append_simulations(theta, x, proposal=proposal).train(
-                max_num_epochs=max_epochs, 
-                final_round=final_round
-            )
+            # Note: proposal is passed to append_simulations to inform about the proposal used for simulation
+            inference = inference.append_simulations(theta, x, proposal=proposal)
+            density_estimator = inference.train(**train_kwargs)
             
         # C. Build Posterior & Update Proposal
         posterior = inference.build_posterior(density_estimator).set_default_x(x_obs_stats)
         proposal = posterior
+
         
     # 4. Final Sampling
     print("Sampling from final posterior...")

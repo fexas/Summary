@@ -113,26 +113,31 @@ def compute_bandwidth_core(theta0_np, x_obs_tensor, task, stats_fn, n_samples, q
     print(f"Computed bandwidth (epsilon): {quan1}")
     return quan1
 
-def approximate_likelihood_core(theta, x_obs_stats, task, stats_fn, nsims, epsilon, device):
+def approximate_likelihood_core(theta, x_obs_stats, task, stats_fn, epsilon, device):
     """
     Core approximate likelihood computation.
+    Optimized for nsims=1 and minimal overhead.
     """
-    batch_size = theta.shape[0]
-    theta_exp = np.repeat(theta, nsims, axis=0)
-    sim_data = task.simulator(theta_exp, n_samples=task.n_obs)
+    # 1. Simulate (Numpy) - forced by task.simulator
+    # theta: (batch, d)
+    sim_data = task.simulator(theta, n_samples=task.n_obs)
+    
+    # 2. To Tensor
     sim_data_tensor = torch.from_numpy(sim_data).float().to(device)
     
     with torch.no_grad():
+        # 3. Stats (Tensor)
         sim_stats = stats_fn(sim_data_tensor)
         
-    sim_stats = sim_stats.view(batch_size, nsims, -1)
-    target = x_obs_stats.unsqueeze(0)
-    
-    diff = sim_stats - target
-    dist_sq = torch.sum(diff**2, dim=-1)
-    
-    kernel = torch.exp(-dist_sq / (2 * epsilon**2))
-    likelihood = torch.mean(kernel, dim=1)
+        # 4. Distance (Tensor)
+        # x_obs_stats should be (1, dim) or (dim,)
+        # sim_stats is (batch, dim)
+        diff = sim_stats - x_obs_stats
+        dist_sq = torch.sum(diff**2, dim=-1)
+        
+        # 5. Kernel (Gaussian)
+        # likelihood = exp(-dist^2 / (2*eps^2))
+        likelihood = torch.exp(-dist_sq / (2 * epsilon**2))
     
     return likelihood.cpu().numpy()
 
@@ -173,7 +178,7 @@ def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.
 
 def refine_posterior_smmd(model, x_obs, task, 
                          n_chains=1000, n_samples=1, burn_in=99, 
-                         thin=1, nsims=50, epsilon=None, proposal_std=0.5, device=None):
+                         thin=1, epsilon=None, proposal_std=0.5, device=None, theta_init=None):
     if device is None:
         try:
             device = next(model.parameters()).device
@@ -197,12 +202,20 @@ def refine_posterior_smmd(model, x_obs, task,
     with torch.no_grad():
         x_obs_stats = model.T(x_obs_tensor)
         # Initial samples
-        Z = torch.randn(n_chains, 1, task.d, device=device)
-        current_theta = model.G(Z, x_obs_stats.expand(n_chains, -1)).squeeze(1).cpu().numpy()
+        if theta_init is not None:
+            print(f"Using provided initial points for MCMC (shape: {theta_init.shape})")
+            current_theta = theta_init
+            # Ensure shape matches n_chains if possible, or just use what is given
+            if current_theta.shape[0] != n_chains:
+                print(f"Warning: theta_init shape {current_theta.shape} != n_chains {n_chains}. Adjusting n_chains.")
+                n_chains = current_theta.shape[0]
+        else:
+            Z = torch.randn(n_chains, 1, task.d, device=device)
+            current_theta = model.G(Z, x_obs_stats.expand(n_chains, -1)).squeeze(1).cpu().numpy()
         
     # 2. Define Likelihood Function
     def likelihood_fn(theta, target_stats):
-        return approximate_likelihood_core(theta, target_stats, task, model.T, nsims, epsilon, device)
+        return approximate_likelihood_core(theta, target_stats, task, model.T, epsilon, device)
         
     # 3. Run MCMC
     return run_mcmc_refinement(current_theta, x_obs_stats, task, 
@@ -215,7 +228,7 @@ def refine_posterior_smmd(model, x_obs, task,
 
 def refine_posterior_bayesflow(model, x_obs, task, 
                              n_chains=1000, n_samples=1, burn_in=99, 
-                             thin=1, nsims=50, epsilon=None, proposal_std=0.5, device=None):
+                             thin=1, epsilon=None, proposal_std=0.5, device=None, theta_init=None):
     if device is None:
         # Infer device from model (Keras model usually manages its own device, but we need it for tensors)
         device = "cpu"
@@ -228,18 +241,25 @@ def refine_posterior_bayesflow(model, x_obs, task,
         epsilon = compute_bandwidth_bayesflow(model, x_obs, task, device=device)
         
     # 2. Initial Points
-    # Sample from BayesFlow model
     x_obs_cpu = x_obs if isinstance(x_obs, np.ndarray) else x_obs.cpu().numpy()
     if x_obs_cpu.ndim == 2: x_obs_cpu = x_obs_cpu[np.newaxis, ...]
-    
-    # Replicate x_obs for batch sampling
-    x_obs_rep = np.tile(x_obs_cpu, (n_chains, 1, 1))
-    
-    post = model.sample(conditions={"summary_variables": x_obs_rep}, num_samples=1)
-    if isinstance(post, dict): post = post["inference_variables"]
-    current_theta = post.reshape(n_chains, -1)
-    if isinstance(current_theta, torch.Tensor):
-        current_theta = current_theta.cpu().numpy()
+
+    if theta_init is not None:
+        print(f"Using provided initial points for MCMC (shape: {theta_init.shape})")
+        current_theta = theta_init
+        if current_theta.shape[0] != n_chains:
+             print(f"Warning: theta_init shape {current_theta.shape} != n_chains {n_chains}. Adjusting n_chains.")
+             n_chains = current_theta.shape[0]
+    else:
+        # Sample from BayesFlow model
+        # Replicate x_obs for batch sampling
+        x_obs_rep = np.tile(x_obs_cpu, (n_chains, 1, 1))
+        
+        post = model.sample(conditions={"summary_variables": x_obs_rep}, num_samples=1)
+        if isinstance(post, dict): post = post["inference_variables"]
+        current_theta = post.reshape(n_chains, -1)
+        if isinstance(current_theta, torch.Tensor):
+            current_theta = current_theta.cpu().numpy()
         
     # 3. MCMC
     x_obs_tensor = torch.from_numpy(x_obs_cpu).float().to(device)
@@ -253,16 +273,26 @@ def refine_posterior_bayesflow(model, x_obs, task,
         x_np = x_tensor.cpu().numpy()
         # model.summary_network expects (batch, n_obs, d_x)
         # returns (batch, summary_dim)
-        stats = model.summary_network(x_np)
-        return torch.from_numpy(stats.numpy()).float().to(device)
+        stats = model.summary_network(x_np.astype(np.float32))
+        
+        if hasattr(stats, "cpu"): stats = stats.cpu()
+        if hasattr(stats, "numpy"): stats = stats.numpy()
+        
+        return torch.from_numpy(stats).float().to(device)
 
     # Pre-compute x_obs_stats
     # model.summary_network might return a tensor or numpy
+    # Ensure float32 for model input
+    x_obs_cpu = x_obs_cpu.astype(np.float32)
     x_obs_stats_tf = model.summary_network(x_obs_cpu)
-    x_obs_stats = torch.from_numpy(x_obs_stats_tf.numpy()).float().to(device)
+    
+    if hasattr(x_obs_stats_tf, "cpu"): x_obs_stats_tf = x_obs_stats_tf.cpu()
+    if hasattr(x_obs_stats_tf, "numpy"): x_obs_stats_tf = x_obs_stats_tf.numpy()
+    
+    x_obs_stats = torch.from_numpy(x_obs_stats_tf).float().to(device)
     
     def likelihood_fn(theta, target_stats):
-        return approximate_likelihood_core(theta, target_stats, task, stats_fn_torch, nsims, epsilon, device)
+        return approximate_likelihood_core(theta, target_stats, task, stats_fn_torch, epsilon, device)
         
     return run_mcmc_refinement(current_theta, x_obs_stats, task,
                               task.log_prior, likelihood_fn,
@@ -278,7 +308,9 @@ def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_lev
     # Get stats
     # Ensure x_sim is float32 (simulator might return int for population counts)
     x_sim_float = x_sim.astype(np.float32)
-    stats_sim = model.summary_network(x_sim_float).numpy()
+    stats_sim = model.summary_network(x_sim_float)
+    if hasattr(stats_sim, "cpu"): stats_sim = stats_sim.cpu()
+    if hasattr(stats_sim, "numpy"): stats_sim = stats_sim.numpy()
     
     # Get obs stats
     x_obs_cpu = x_obs if isinstance(x_obs, np.ndarray) else x_obs.cpu().numpy()
@@ -286,7 +318,9 @@ def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_lev
     
     # Ensure float32
     x_obs_cpu = x_obs_cpu.astype(np.float32)
-    stats_obs = model.summary_network(x_obs_cpu).numpy()
+    stats_obs = model.summary_network(x_obs_cpu)
+    if hasattr(stats_obs, "cpu"): stats_obs = stats_obs.cpu()
+    if hasattr(stats_obs, "numpy"): stats_obs = stats_obs.numpy()
     
     # Distances
     diff = stats_sim - stats_obs
