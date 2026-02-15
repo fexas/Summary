@@ -4,7 +4,7 @@ import torch.nn as nn
 import numpy as np
 from models.smmd import SMMD_Model
 
-def mmd_loss(theta_true, theta_fake, bandwidths=None, n_time_steps=151, weights=None):
+def mmd_loss(theta_true, theta_fake, bandwidths=None, n_time_steps=151):
     """
     Compute Maximum Mean Discrepancy (MMD) with Gaussian Kernel.
     theta_true: (batch, d)
@@ -23,7 +23,7 @@ def mmd_loss(theta_true, theta_fake, bandwidths=None, n_time_steps=151, weights=
     # coefficient = bandwidth ** (d / 2) -> 1/coefficient
     
     if bandwidths is None:
-        bandwidths = torch.tensor([50.0 / n_time_steps], device=device)
+        bandwidths = torch.tensor([30.0 / n_time_steps], device=device)
     elif not isinstance(bandwidths, torch.Tensor):
         bandwidths = torch.tensor(bandwidths, device=device, dtype=torch.float32)
     else:
@@ -77,12 +77,7 @@ def mmd_loss(theta_true, theta_fake, bandwidths=None, n_time_steps=151, weights=
     mean_K_GT = torch.mean(total_K_GT, dim=(1, 2))
     mean_K_TT = torch.mean(total_K_TT, dim=(1, 2))
     
-    # MMD squared
     mmd = mean_K_GG + mean_K_TT - 2 * mean_K_GT
-    
-    if weights is not None:
-        return torch.mean(mmd * weights)
-    
     return torch.mean(mmd)
 
 class MMD_Model(SMMD_Model):

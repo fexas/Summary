@@ -1,4 +1,4 @@
-name: SummaryLearning
+name: SummaryL
 channels:
   - conda-forge
   - defaults
@@ -258,4 +258,4 @@ dependencies:
       - xarray-einstats==0.9.1
       - zict==3.0.0
       - zuko==1.5.0
-prefix: /Users/liruismac/miniconda3
+prefix: /Users/mike-fx/miniconda3

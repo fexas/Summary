@@ -3,27 +3,52 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+
+def _init_normal_0_2(m):
+    if isinstance(m, nn.Linear):
+        nn.init.normal_(m.weight, mean=0.0, std=0.2)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    if isinstance(m, nn.Conv1d):
+        nn.init.normal_(m.weight, mean=0.0, std=0.2)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        norm = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(norm + self.eps)
+        return self.weight * x
+
 class InvariantModule(nn.Module):
     def __init__(self, settings):
         super().__init__()
         
-        # S1: Dense layers before pooling
         s1_layers = []
         in_dim = settings["input_dim"]
         for _ in range(settings["num_dense_s1"]):
-            s1_layers.append(nn.Linear(in_dim, settings["dense_s1_args"]["units"]))
+            units = settings["dense_s1_args"]["units"]
+            s1_layers.append(nn.Linear(in_dim, units))
+            s1_layers.append(RMSNorm(units))
             s1_layers.append(nn.ReLU())
-            in_dim = settings["dense_s1_args"]["units"]
+            in_dim = units
         self.s1 = nn.Sequential(*s1_layers)
         self.s1_out_dim = in_dim
         
-        # S2: Dense layers after pooling
         s2_layers = []
         in_dim = self.s1_out_dim
         for _ in range(settings["num_dense_s2"]):
-            s2_layers.append(nn.Linear(in_dim, settings["dense_s2_args"]["units"]))
+            units = settings["dense_s2_args"]["units"]
+            s2_layers.append(nn.Linear(in_dim, units))
+            s2_layers.append(RMSNorm(units))
             s2_layers.append(nn.ReLU())
-            in_dim = settings["dense_s2_args"]["units"]
+            in_dim = units
         self.s2 = nn.Sequential(*s2_layers)
         self.output_dim = in_dim
 
@@ -38,14 +63,14 @@ class EquivariantModule(nn.Module):
         super().__init__()
         self.invariant_module = InvariantModule(settings)
         
-        # S3: Dense layers combining original x and invariant features
         s3_layers = []
-        # Input to S3 is original input_dim + invariant_output_dim
         in_dim = settings["input_dim"] + self.invariant_module.output_dim
         for _ in range(settings["num_dense_s3"]):
-            s3_layers.append(nn.Linear(in_dim, settings["dense_s3_args"]["units"]))
+            units = settings["dense_s3_args"]["units"]
+            s3_layers.append(nn.Linear(in_dim, units))
+            s3_layers.append(RMSNorm(units))
             s3_layers.append(nn.ReLU())
-            in_dim = settings["dense_s3_args"]["units"]
+            in_dim = units
         self.s3 = nn.Sequential(*s3_layers)
         self.output_dim = in_dim
 
@@ -73,12 +98,12 @@ class TimeSeriesSummaryNet(nn.Module):
         
         self.conv_net = nn.Sequential(
             # Block 1
-            nn.Conv1d(in_channels=input_dim, out_channels=hidden_dim, kernel_size=5, padding=2),
+            nn.Conv1d(in_channels=input_dim, out_channels=hidden_dim, kernel_size=10, padding=2),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2),
             
             # Block 2
-            nn.Conv1d(in_channels=hidden_dim, out_channels=hidden_dim*2, kernel_size=5, padding=2),
+            nn.Conv1d(in_channels=hidden_dim, out_channels=hidden_dim*2, kernel_size=10, padding=2),
             nn.ReLU(),
             
             # Global Average Pooling
@@ -86,6 +111,8 @@ class TimeSeriesSummaryNet(nn.Module):
         )
         
         self.fc = nn.Linear(hidden_dim*2, output_dim)
+        self.post_conv_norm = RMSNorm(hidden_dim*2)
+        self.apply(_init_normal_0_2)
         
     def forward(self, x):
         # x: (batch, seq_len, input_dim)
@@ -93,6 +120,7 @@ class TimeSeriesSummaryNet(nn.Module):
         
         features = self.conv_net(x) # (batch, hidden*2, 1)
         features = features.flatten(1) # (batch, hidden*2)
+        features = self.post_conv_norm(features)
         
         return self.fc(features)
 
@@ -126,6 +154,7 @@ class DeepSetSummaryNet(nn.Module):
         
         # Output Layer
         self.out_layer = nn.Linear(self.inv.output_dim, output_dim)
+        self.apply(_init_normal_0_2)
         
     def forward(self, x):
         # x: (batch, n_points, input_dim)
@@ -138,15 +167,23 @@ class Generator(nn.Module):
     def __init__(self, z_dim=5, stats_dim=10, out_dim=5):
         super().__init__()
         input_dim = z_dim + stats_dim
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, out_dim)
-        )
+        layers = []
+        hidden_dim = 64
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(RMSNorm(hidden_dim))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, hidden_dim))
+        layers.append(RMSNorm(hidden_dim))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, hidden_dim))
+        layers.append(RMSNorm(hidden_dim))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, hidden_dim))
+        layers.append(RMSNorm(hidden_dim))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        self.net = nn.Sequential(*layers)
+        self.apply(_init_normal_0_2)
         
     def forward(self, z, stats):
         # z: (batch, M, z_dim)
@@ -194,7 +231,7 @@ class SMMD_Model(nn.Module):
         
         return samples.cpu().numpy()
 
-def sliced_mmd_loss(theta_true, theta_fake, num_slices=20, n_time_steps=151, weights=None):
+def sliced_mmd_loss(theta_true, theta_fake, num_slices=20, n_time_steps=151):
     # theta_true: (batch, d) -> unsqueeze to (batch, 1, d)
     # theta_fake: (batch, M, d)
     
@@ -215,7 +252,7 @@ def sliced_mmd_loss(theta_true, theta_fake, num_slices=20, n_time_steps=151, wei
     
     # 2. Compute MMD on projections (using Gaussian Kernel)
     # Bandwidth
-    bandwidth = 10.0 / (1.0 * n_time_steps)
+    bandwidth = 5.0 / (1.0 * n_time_steps)
     
     # Diff matrices: (batch, M, M, L) or (batch, 1, M, L) etc.
     # To compute efficiently:
@@ -236,18 +273,11 @@ def sliced_mmd_loss(theta_true, theta_fake, num_slices=20, n_time_steps=151, wei
     K_GT = torch.exp(-0.5 * diff_GT.pow(2) / bandwidth)
     loss_GT = torch.mean(K_GT, dim=(1, 2)) # Mean over M and L
     
-    # MMD Loss = E[K_GG] + E[K_TT] - 2*E[K_GT]
     loss = loss_GG + loss_TT - 2 * loss_GT
-    
-    if weights is not None:
-        # weights: (batch,)
-        loss = torch.mean(loss * weights)
-    else:
-        loss = torch.mean(loss) # Mean over batch
-        
+    loss = torch.mean(loss)
     return loss
 
-def mixture_sliced_mmd_loss(theta_true, theta_fake, bandwidths=None, num_slices=20, n_time_steps=151, weights=None):
+def mixture_sliced_mmd_loss(theta_true, theta_fake, bandwidths=None, num_slices=20, n_time_steps=151):
     """
     Mixture Bandwidth Sliced MMD Loss.
     
@@ -271,7 +301,7 @@ def mixture_sliced_mmd_loss(theta_true, theta_fake, bandwidths=None, num_slices=
     
     # Default bandwidths if not provided
     if bandwidths is None:
-        bandwidths = [10.0 / n_time_steps, 20.0 / n_time_steps]
+        bandwidths = [20.0 / n_time_steps, 20.0 / n_time_steps]
     
     # Ensure bandwidths is a tensor
     if not isinstance(bandwidths, torch.Tensor):
@@ -349,12 +379,6 @@ def mixture_sliced_mmd_loss(theta_true, theta_fake, bandwidths=None, num_slices=
     # Mean over M, L, and K
     loss_GT = torch.mean(K_GT_all, dim=(1, 2, 3)) # (batch,)
     
-    # MMD Loss
     loss = loss_GG + loss_TT - 2 * loss_GT
-    
-    if weights is not None:
-        loss = torch.mean(loss * weights)
-    else:
-        loss = torch.mean(loss)
-        
+    loss = torch.mean(loss)
     return loss

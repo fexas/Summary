@@ -81,7 +81,7 @@ L = SMMD_MMD_CONFIG.get("L", 20)
 N_TIME_STEPS = CONFIG.get("n_time_steps", 151)
 DT = CONFIG.get("dt", 0.2)
 
-LEARNING_RATE = CONFIG.get("learning_rate", 1e-3)
+LEARNING_RATE = CONFIG.get("learning_rate", 3e-4)
 N_SAMPLES_POSTERIOR = CONFIG.get("n_samples_posterior", 1000)
 
 # Task Dimensions
@@ -115,7 +115,7 @@ L1_LAMBDA = 1e-4
 
 def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd", n_time_steps=151):
     """Training loop for SMMD and MMD models."""
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scheduler = get_scheduler(optimizer, epochs)
     
     model.to(device)
@@ -131,8 +131,6 @@ def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd", n_tim
         for batch in train_loader:
             x_batch = batch[0].to(device)
             theta_batch = batch[1].to(device)
-            # Check for weights
-            weights_batch = batch[2].to(device) if len(batch) > 2 else None
             
             optimizer.zero_grad()
             
@@ -144,12 +142,10 @@ def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd", n_tim
                 # Forward pass
                 theta_fake = model(x_batch, z)
                 
-                # Compute Loss
                 if model_type == "smmd":
-                    # Mixture Sliced MMD Loss (default bandwidths handled internally: [5.0/n_time_steps, 15.0/n_time_steps])
-                    loss = mixture_sliced_mmd_loss(theta_batch, theta_fake, num_slices=L, n_time_steps=n_time_steps, weights=weights_batch)
+                    loss = sliced_mmd_loss(theta_batch, theta_fake, num_slices=L, n_time_steps=n_time_steps)
                 elif model_type == "mmd":
-                    loss = mmd_loss(theta_batch, theta_fake, n_time_steps=n_time_steps, weights=weights_batch)
+                    loss = mmd_loss(theta_batch, theta_fake, n_time_steps=n_time_steps)
                 else:
                     raise ValueError(f"Unknown model type: {model_type}")
                 
@@ -271,10 +267,11 @@ def plot_posterior(theta_samples, theta_true, output_dir, filename="posterior.pn
     for i in range(cols):
         ax = axes[i]
         param_name = f'theta{i+1}'
+        param_symbol = rf'$\theta_{{{i+1}}}$'
         sns.kdeplot(data=df, x=param_name, fill=True, alpha=0.5, ax=ax, label='Posterior')
         if i < len(theta_true):
             ax.axvline(x=theta_true[i], color='red', linestyle='--', linewidth=2, label='True')
-        ax.set_title(f'Marginal {param_name}')
+        ax.set_title(f'Marginal {param_symbol}')
         ax.legend()
         
     plt.tight_layout()
@@ -297,7 +294,7 @@ def plot_combined_posteriors(all_model_samples, theta_true, output_dir, filename
     num_params = next(iter(all_model_samples.values())).shape[1]
     cols = num_params
     
-    fig, axes = plt.subplots(1, cols, figsize=(5 * cols, 5))
+    fig, axes = plt.subplots(1, cols, figsize=(6 * cols, 6))
     if cols == 1: axes = [axes]
     
     # Define colors or styles if needed, but seaborn handles hue well if we dataframe it
@@ -305,14 +302,21 @@ def plot_combined_posteriors(all_model_samples, theta_true, output_dir, filename
     for i in range(cols):
         ax = axes[i]
         param_name = f'theta{i+1}'
+        param_symbol = rf'$\theta_{{{i+1}}}$'
         
         for model_name, samples in all_model_samples.items():
-            sns.kdeplot(x=samples[:, i], label=model_name.upper(), ax=ax, alpha=0.3, fill=False, linewidth=2)
+            label_name = model_name
+            if model_name.endswith("_refineplus"):
+                base = model_name[:-11]
+                label_name = f"{base.upper()}+Refine+"
+            else:
+                label_name = model_name.upper()
+            sns.kdeplot(x=samples[:, i], label=label_name, ax=ax, alpha=0.3, fill=False, linewidth=2)
             
         if i < len(theta_true):
             ax.axvline(x=theta_true[i], color='black', linestyle='--', linewidth=2, label='True')
             
-        ax.set_title(f'Marginal {param_name}')
+        ax.set_title(f'Marginal {param_symbol}')
         ax.legend()
         
     plt.tight_layout()
@@ -336,6 +340,7 @@ def plot_refinement_comparison(samples_dict, theta_true, output_dir, model_name)
     for i in range(cols):
         ax = axes[i]
         param_name = f'theta{i+1}'
+        param_symbol = rf'$\theta_{{{i+1}}}$'
         
         for label, samples in samples_dict.items():
             if samples is not None:
@@ -344,7 +349,7 @@ def plot_refinement_comparison(samples_dict, theta_true, output_dir, model_name)
         if i < len(theta_true):
             ax.axvline(x=theta_true[i], color='black', linestyle='--', linewidth=2, label='True')
             
-        ax.set_title(f'{model_name.upper()} - {param_name}')
+        ax.set_title(f'{model_name.upper()} - {param_symbol}')
         ax.legend()
         
     plt.tight_layout()
@@ -367,7 +372,6 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
     loss_history = []
     training_time = 0.0
     
-    # Trackers
     timings = {"initial": 0.0, "refined_plus": 0.0, "mcmc": 0.0}
     samples_dict = {}
     
@@ -436,14 +440,15 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
         
     sampling_time = time.time() - t_start_sample
     
-    # 3. Compute Metrics
+    # 3. Compute Metrics (Initial posterior)
     metrics = compute_metrics(posterior_samples, theta_true)
     metrics["training_time"] = training_time
     metrics["sampling_time"] = sampling_time
     metrics["stage"] = "initial"
+    metrics_initial = metrics.copy()
     
-    # Store Initial
-    timings["initial"] = training_time
+    # Store Initial: total wall-clock for initial posterior (train + sample)
+    timings["initial"] = training_time + sampling_time
     samples_dict["initial"] = posterior_samples
     
     # Save Samples & Plot
@@ -455,8 +460,8 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
     plot_posterior(posterior_samples, theta_true, base_dir, "posterior_plot.png")
     
     print(f"Bias L2: {metrics['bias_l2']:.4f}")
-    print(f"HDI Length (Mean): {np.mean(metrics['hdi_length']):.4f}")
-    print(f"Coverage (Mean): {np.mean(metrics['coverage']):.4f}")
+    print(f"HDI Length per param: {metrics['hdi_length']}")
+    print(f"Coverage per param: {metrics['coverage']}")
     
     # ========================================================================
     # 4. Save Initial Model
@@ -679,19 +684,10 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
             
             # Store for MCMC
             theta_init_mcmc = theta_resampled
-            samples_dict["refined_plus"] = theta_resampled
+            samples_dict["refined_plus_pre_mcmc"] = theta_resampled
                     
-            # Metrics Retrained (Resampled)
-            metrics_retrained = compute_metrics(theta_resampled, theta_true)
-            metrics_retrained["training_time"] = training_time + time_retrain 
-            metrics_retrained["stage"] = f"refined_round{refine_round_idx}"
-            print(f"   Retrained & Resampled (Round {refine_round_idx}) Bias L2: {metrics_retrained['bias_l2']:.4f}")
-            
-            # Save Samples & Plot
-            refined_dir = f"results/models/{model_type}/round_{round_id}/refined_round_{refine_round_idx}"
-            os.makedirs(refined_dir, exist_ok=True)
-            np.save(f"{refined_dir}/posterior_samples.npy", theta_resampled)
-            plot_posterior(theta_resampled, theta_true, refined_dir, "posterior_plot.png")
+            theta_init_mcmc = theta_resampled
+            samples_dict["refined_plus_pre_mcmc"] = theta_resampled
             
     # ========================================================================
             
@@ -730,7 +726,9 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
         print(f"   ABC-MCMC done in {time_mcmc:.2f}s")
         
         timings["mcmc"] = time_mcmc
+        timings["refined_plus"] = timings["refined_plus"] + timings["mcmc"]
         samples_dict["mcmc"] = theta_mcmc
+        samples_dict["refined_plus"] = theta_mcmc
         
         # Metrics MCMC
         metrics_mcmc = compute_metrics(theta_mcmc, theta_true)
@@ -742,26 +740,30 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
              # Let's just add it if it happened.
              pass 
              
-        metrics_mcmc["training_time"] = total_train_time + time_mcmc # + retrain time ideally
+        metrics_mcmc["training_time"] = total_train_time + time_mcmc
         metrics_mcmc["stage"] = "refined_mcmc"
         print(f"   MCMC Bias L2: {metrics_mcmc['bias_l2']:.4f}")
+        print(f"   MCMC HDI Length (Mean): {np.mean(metrics_mcmc['hdi_length']):.4f}")
+        print(f"   MCMC Coverage (Mean): {np.mean(metrics_mcmc['coverage']):.4f}")
         
         # Save Samples & Plot
-        mcmc_dir = f"results/models/{model_type}/round_{round_id}/abc_mcmc"
-        os.makedirs(mcmc_dir, exist_ok=True)
-        np.save(f"{mcmc_dir}/posterior_samples.npy", theta_mcmc)
-        plot_posterior(theta_mcmc, theta_true, mcmc_dir, "posterior_plot.png")
+        refine_dir = f"results/models/{model_type}/round_{round_id}/refineplus"
+        os.makedirs(refine_dir, exist_ok=True)
+        np.save(f"{refine_dir}/posterior_samples.npy", theta_mcmc)
+        plot_posterior(theta_mcmc, theta_true, refine_dir, "posterior_plot.png")
         
         return {
             "metrics": metrics_mcmc,
             "timings": timings,
-            "samples": samples_dict
+            "samples": samples_dict,
+            "metrics_initial": metrics_initial
         }
 
     return {
         "metrics": metrics,
         "timings": timings,
-        "samples": samples_dict
+        "samples": samples_dict,
+        "metrics_initial": metrics_initial
     }
 
 def main():
@@ -795,8 +797,8 @@ def main():
         # Ground Truth for this round
         theta_true, x_obs = task.get_ground_truth()
         
-        # Storage for Combined Plot (Initial Posteriors)
         round_initial_samples = {}
+        round_refineplus_samples = {}
         
         # Run Models
         for model_name in MODELS:
@@ -813,37 +815,63 @@ def main():
                     timings = res["timings"]
                     samples = res["samples"]
                     
-                    # Store for Plot 1 (Combined Initial)
                     if "initial" in samples:
                         round_initial_samples[model_name] = samples["initial"]
-                        
-                    # Plot 2: Refinement Comparison (Initial vs SL vs MCMC)
-                    # For SMMD/MMD/Bayesflow
+                    
                     if model_name in ["smmd", "mmd", "bayesflow"]:
-                         # Check if we have refinement samples
-                         if "refined_plus" in samples or "mcmc" in samples:
-                             # Create labels mapping
-                             plot_samples = {
-                                 "Initial": samples.get("initial"),
-                                 "Refined+": samples.get("refined_plus"),
-                                 "Refined (MCMC)": samples.get("mcmc")
-                             }
-                             # Remove None
-                             plot_samples = {k: v for k, v in plot_samples.items() if v is not None}
-                             
-                             plot_dir = f"results/models/{model_name}/round_{round_idx}/comparison"
-                             plot_refinement_comparison(plot_samples, theta_true, plot_dir, model_name)
+                        final_refined = None
+                        for key in ["refined_plus", "mcmc", "refined_plus_pre_mcmc"]:
+                            value = samples.get(key)
+                            if value is not None:
+                                final_refined = value
+                                break
+                        if final_refined is not None:
+                            round_refineplus_samples[f"{model_name}_refineplus"] = final_refined
+                            
+                            plot_samples = {
+                                "Initial": samples.get("initial"),
+                                "Refine+": final_refined
+                            }
+                            plot_samples = {k: v for k, v in plot_samples.items() if v is not None}
+                            
+                            plot_dir = f"results/models/{model_name}/round_{round_idx}/comparison"
+                            plot_refinement_comparison(plot_samples, theta_true, plot_dir, model_name)
 
-                    # Prepare Row for Table
+                    metrics_initial = res.get("metrics_initial")
+                    
                     row = metrics.copy()
                     row["round"] = round_idx
-                    row["status"] = 1 # Success
+                    row["status"] = 1
+                    
+                    if metrics_initial is not None:
+                        if "bias_l2" in metrics_initial:
+                            row["bias_l2_initial"] = metrics_initial["bias_l2"]
+                        if "hdi_length" in metrics_initial:
+                            row["hdi_length_initial"] = metrics_initial["hdi_length"]
+                        if "coverage" in metrics_initial:
+                            row["coverage_initial"] = metrics_initial["coverage"]
+                    else:
+                        if "bias_l2" in metrics:
+                            row["bias_l2_initial"] = metrics["bias_l2"]
+                        if "hdi_length" in metrics:
+                            row["hdi_length_initial"] = metrics["hdi_length"]
+                        if "coverage" in metrics:
+                            row["coverage_initial"] = metrics["coverage"]
+                    
+                    if model_name in ["smmd", "mmd", "bayesflow"]:
+                        if "bias_l2" in metrics:
+                            row["bias_l2_refineplus"] = metrics["bias_l2"]
+                        if "hdi_length" in metrics:
+                            row["hdi_length_refineplus"] = metrics["hdi_length"]
+                        if "coverage" in metrics:
+                            row["coverage_refineplus"] = metrics["coverage"]
+                    
                     # Add formatted times
                     row["time_initial"] = format_time(timings["initial"])
                     row["time_refined_plus"] = format_time(timings["refined_plus"])
                     row["time_mcmc"] = format_time(timings["mcmc"])
                     
-                    # Keep raw seconds for averaging if needed later, or just rely on re-parsing
+                    # Keep raw seconds for averaging
                     row["seconds_initial"] = timings["initial"]
                     row["seconds_refined_plus"] = timings["refined_plus"]
                     row["seconds_mcmc"] = timings["mcmc"]
@@ -863,10 +891,14 @@ def main():
                 }
                 model_results_table[model_name].append(row)
 
-        # End of Round: Plot Combined Posteriors
         if round_initial_samples:
             print("Generating combined posterior plot...")
             plot_combined_posteriors(round_initial_samples, theta_true, f"results/comparisons/round_{round_idx}", "all_methods_initial_posterior.png")
+        
+        if round_refineplus_samples:
+            combined_samples = dict(round_initial_samples)
+            combined_samples.update(round_refineplus_samples)
+            plot_combined_posteriors(combined_samples, theta_true, f"results/comparisons/round_{round_idx}", "all_methods_with_refineplus_posterior.png")
 
     # ============================================================================
     # 4. Final Aggregation
@@ -882,57 +914,211 @@ def main():
         if not rows:
             continue
             
-        # Save per-model table
+        # Save raw per-round table (for debugging)
         df_model = pd.DataFrame(rows)
-        # Reorder columns for clarity
         cols = ["round", "status", "stage", "bias_l2", "hdi_length", "coverage", 
                 "time_initial", "time_refined_plus", "time_mcmc"]
-        # Add other cols if exist
         other_cols = [c for c in df_model.columns if c not in cols and not c.startswith("seconds_")]
         final_cols = cols + other_cols
-        # Filter existing columns only
         final_cols = [c for c in final_cols if c in df_model.columns]
-        
         df_model = df_model[final_cols]
         df_model.to_csv(f"results/tables/{model_name}_results.csv", index=False)
         print(f"Saved table for {model_name} to results/tables/{model_name}_results.csv")
             
-        # Compute Summary Stats
         success_rows = [r for r in rows if r.get("status", 0) == 1]
         if not success_rows:
             print(f"No successful runs for {model_name}")
             continue
-            
-        bias_l2 = [r["bias_l2"] for r in success_rows]
-        hdi_length = [np.mean(r["hdi_length"]) for r in success_rows]
-        coverage = [np.mean(r["coverage"]) for r in success_rows]
         
-        # Average Times
+        # Determine parameter dimension from any successful row
+        example = None
+        for r in success_rows:
+            if "hdi_length_initial" in r or "hdi_length" in r:
+                example = r
+                break
+        if example is None:
+            print(f"No HDI information for {model_name}, skipping aggregation.")
+            continue
+        if "hdi_length_initial" in example:
+            example_hdi = np.asarray(example["hdi_length_initial"], dtype=float)
+        else:
+            example_hdi = np.asarray(example["hdi_length"], dtype=float)
+        num_params = example_hdi.shape[0]
+        
+        # Build per-round metrics table under results/models/{model_name}
+        per_round_rows = []
+        refine_models = ["smmd", "mmd", "bayesflow"]
+        
+        for r in rows:
+            round_id = r.get("round", np.nan)
+            status = r.get("status", 0)
+            
+            if status != 1:
+                row_metrics = {
+                    "round": round_id,
+                    "Bias": np.nan,
+                    "RefinePlus_Bias": np.nan,
+                }
+                for j in range(num_params):
+                    row_metrics[f"HDI_Len_Param{j+1}"] = np.nan
+                    row_metrics[f"Coverage_Param{j+1}"] = np.nan
+                    row_metrics[f"RefinePlus_HDI_Len_Param{j+1}"] = np.nan
+                    row_metrics[f"RefinePlus_Coverage_Param{j+1}"] = np.nan
+                per_round_rows.append(row_metrics)
+                continue
+            
+            if "bias_l2_initial" in r:
+                bias_init = r["bias_l2_initial"]
+            elif "bias_l2" in r:
+                bias_init = r["bias_l2"]
+            else:
+                bias_init = np.nan
+            
+            if model_name in refine_models and "bias_l2_refineplus" in r:
+                bias_ref = r["bias_l2_refineplus"]
+            else:
+                bias_ref = np.nan
+            
+            if "hdi_length_initial" in r:
+                hdi_init = np.asarray(r["hdi_length_initial"], dtype=float)
+            elif "hdi_length" in r:
+                hdi_init = np.asarray(r["hdi_length"], dtype=float)
+            else:
+                hdi_init = np.full(num_params, np.nan)
+            
+            if model_name in refine_models and "hdi_length_refineplus" in r:
+                hdi_ref = np.asarray(r["hdi_length_refineplus"], dtype=float)
+            else:
+                hdi_ref = np.full(num_params, np.nan)
+            
+            if "coverage_initial" in r:
+                cov_init = np.asarray(r["coverage_initial"], dtype=float)
+            elif "coverage" in r:
+                cov_init = np.asarray(r["coverage"], dtype=float)
+            else:
+                cov_init = np.full(num_params, np.nan)
+            
+            if model_name in refine_models and "coverage_refineplus" in r:
+                cov_ref = np.asarray(r["coverage_refineplus"], dtype=float)
+            else:
+                cov_ref = np.full(num_params, np.nan)
+            
+            row_metrics = {
+                "round": round_id,
+                "Bias": bias_init,
+                "RefinePlus_Bias": bias_ref,
+            }
+            for j in range(num_params):
+                row_metrics[f"HDI_Len_Param{j+1}"] = hdi_init[j]
+                row_metrics[f"Coverage_Param{j+1}"] = cov_init[j]
+                row_metrics[f"RefinePlus_HDI_Len_Param{j+1}"] = hdi_ref[j]
+                row_metrics[f"RefinePlus_Coverage_Param{j+1}"] = cov_ref[j]
+            
+            per_round_rows.append(row_metrics)
+        
+        per_round_df = pd.DataFrame(per_round_rows)
+        model_dir = f"results/models/{model_name}"
+        os.makedirs(model_dir, exist_ok=True)
+        per_round_path = f"{model_dir}/{model_name}_per_round_metrics.csv"
+        per_round_df.to_csv(per_round_path, index=False)
+        print(f"Saved per-round metrics for {model_name} to {per_round_path}")
+        
+        # Aggregated statistics for final_summary
+        bias_initial = []
+        bias_refineplus = []
+        hdi_initial_list = []
+        hdi_refineplus_list = []
+        coverage_initial_list = []
+        coverage_refineplus_list = []
+        
+        for r in success_rows:
+            if "bias_l2_initial" in r:
+                bias_initial.append(r["bias_l2_initial"])
+            elif "bias_l2" in r:
+                bias_initial.append(r["bias_l2"])
+            if model_name in refine_models and "bias_l2_refineplus" in r:
+                bias_refineplus.append(r["bias_l2_refineplus"])
+            
+            if "hdi_length_initial" in r:
+                hdi_initial_list.append(np.asarray(r["hdi_length_initial"], dtype=float))
+            elif "hdi_length" in r:
+                hdi_initial_list.append(np.asarray(r["hdi_length"], dtype=float))
+            if model_name in refine_models and "hdi_length_refineplus" in r:
+                hdi_refineplus_list.append(np.asarray(r["hdi_length_refineplus"], dtype=float))
+            
+            if "coverage_initial" in r:
+                coverage_initial_list.append(np.asarray(r["coverage_initial"], dtype=float))
+            elif "coverage" in r:
+                coverage_initial_list.append(np.asarray(r["coverage"], dtype=float))
+            if model_name in refine_models and "coverage_refineplus" in r:
+                coverage_refineplus_list.append(np.asarray(r["coverage_refineplus"], dtype=float))
+        
+        hdi_initial_arr = np.vstack(hdi_initial_list)
+        avg_hdi_len_initial = hdi_initial_arr.mean(axis=0)
+        
+        coverage_initial_arr = np.vstack(coverage_initial_list)
+        avg_coverage_initial = coverage_initial_arr.mean(axis=0)
+        
+        if hdi_refineplus_list:
+            hdi_refineplus_arr = np.vstack(hdi_refineplus_list)
+            avg_hdi_len_refineplus = hdi_refineplus_arr.mean(axis=0)
+        else:
+            avg_hdi_len_refineplus = np.full_like(avg_hdi_len_initial, np.nan)
+        
+        if coverage_refineplus_list:
+            coverage_refineplus_arr = np.vstack(coverage_refineplus_list)
+            avg_coverage_refineplus = coverage_refineplus_arr.mean(axis=0)
+        else:
+            avg_coverage_refineplus = np.full_like(avg_coverage_initial, np.nan)
+        
         avg_sec_initial = np.mean([r["seconds_initial"] for r in success_rows])
         avg_sec_sl = np.mean([r["seconds_refined_plus"] for r in success_rows])
         avg_sec_mcmc = np.mean([r["seconds_mcmc"] for r in success_rows])
         
-        mean_bias = np.mean(bias_l2)
-        median_bias = np.median(bias_l2)
-        avg_hdi_len = np.mean(hdi_length)
-        avg_coverage = np.mean(coverage)
+        mean_bias_initial = np.mean(bias_initial)
+        median_bias_initial = np.median(bias_initial)
+        
+        if bias_refineplus:
+            mean_bias_refineplus = np.mean(bias_refineplus)
+            median_bias_refineplus = np.median(bias_refineplus)
+        else:
+            mean_bias_refineplus = np.nan
+            median_bias_refineplus = np.nan
         
         print(f"\nModel: {model_name.upper()}")
-        print(f"  Bias L2: Mean={mean_bias:.4f}")
+        print(f"  Bias L2 (Initial): Mean={mean_bias_initial:.4f}")
+        if not np.isnan(mean_bias_refineplus):
+            print(f"  Bias L2 (Refine+): Mean={mean_bias_refineplus:.4f}")
+        print(f"  HDI Len (Initial) per param: {avg_hdi_len_initial}")
+        if not np.all(np.isnan(avg_hdi_len_refineplus)):
+            print(f"  HDI Len (Refine+) per param: {avg_hdi_len_refineplus}")
+        print(f"  Coverage (Initial) per param: {avg_coverage_initial}")
+        if not np.all(np.isnan(avg_coverage_refineplus)):
+            print(f"  Coverage (Refine+) per param: {avg_coverage_refineplus}")
         print(f"  Avg Time (Initial): {format_time(avg_sec_initial)}")
-        if avg_sec_sl > 0: print(f"  Avg Time (Refined+): {format_time(avg_sec_sl)}")
-        if avg_sec_mcmc > 0: print(f"  Avg Time (MCMC): {format_time(avg_sec_mcmc)}")
+        if avg_sec_sl > 0:
+            print(f"  Avg Time (Refined+): {format_time(avg_sec_sl)}")
+        if avg_sec_mcmc > 0:
+            print(f"  Avg Time (MCMC): {format_time(avg_sec_mcmc)}")
         
-        summary_data.append({
+        summary_row = {
             "Model": model_name,
-            "Bias_Mean": mean_bias,
-            "Bias_Median": median_bias,
-            "HDI_Len_Mean": avg_hdi_len,
-            "Coverage_Mean": avg_coverage,
+            "Bias_Mean": mean_bias_initial,
+            "RefinePlus_Bias_Mean": mean_bias_refineplus,
+            "Bias_Median": median_bias_initial,
+            "RefinePlus_Bias_Median": median_bias_refineplus,
             "Avg_Time_Initial": format_time(avg_sec_initial),
             "Avg_Time_RefinedPlus": format_time(avg_sec_sl),
-            "Avg_Time_MCMC": format_time(avg_sec_mcmc)
-        })
+            "Avg_Time_MCMC": format_time(avg_sec_mcmc),
+        }
+        
+        for j in range(num_params):
+            summary_row[f"HDI_Len_Param{j+1}_Mean"] = avg_hdi_len_initial[j]
+            summary_row[f"Coverage_Param{j+1}_Mean"] = avg_coverage_initial[j]
+            summary_row[f"RefinePlus_HDI_Len_Param{j+1}_Mean"] = avg_hdi_len_refineplus[j]
+            summary_row[f"RefinePlus_Coverage_Param{j+1}_Mean"] = avg_coverage_refineplus[j]
+        
+        summary_data.append(summary_row)
         
     # Save Summary
     df_summary = pd.DataFrame(summary_data)

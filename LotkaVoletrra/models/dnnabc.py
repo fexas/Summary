@@ -2,14 +2,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from models.smmd import SummaryNet
+from models.smmd import TimeSeriesSummaryNet
 
 class DNNABC_Model(nn.Module):
     def __init__(self, d=5, d_x=3, n_points=50):
         super().__init__()
         # DNNABC uses the SummaryNet to predict theta directly
         # So output_dim should be d
-        self.net = SummaryNet(n_points=n_points, input_dim=d_x, output_dim=d)
+        self.net = TimeSeriesSummaryNet(n_points=n_points, input_dim=d_x, output_dim=d)
         self.d = d
         
     def forward(self, x):
@@ -22,7 +22,7 @@ def train_dnnabc(model, train_loader, epochs, device):
     Train DNNABC Regression Model.
     Loss: MSE between predicted theta and true theta.
     """
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0003)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0)
     criterion = nn.MSELoss()
     

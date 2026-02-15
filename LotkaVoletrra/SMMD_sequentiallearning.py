@@ -29,7 +29,7 @@ print(f"Using device: {DEVICE}")
 INITIAL_SAMPLES = 1000
 ROUNDS = 5  # Adjust as needed, usually 10 for SNPE comparison, but let's start with a few
 BATCH_SIZE = 50
-LEARNING_RATE = 5e-4
+LEARNING_RATE = 3e-4
 EPOCHS = 1000
 VAL_FRACTION = 0.1
 PATIENCE = 50
@@ -84,7 +84,7 @@ def train_smmd_with_val(model, dataset, epochs, device, batch_size=BATCH_SIZE, l
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
     scheduler = get_scheduler(optimizer, epochs)
     
     model.to(device)
@@ -107,7 +107,6 @@ def train_smmd_with_val(model, dataset, epochs, device, batch_size=BATCH_SIZE, l
         for batch in train_loader:
             x_batch = batch[0].to(device)
             theta_batch = batch[1].to(device)
-            weights_batch = batch[2].to(device) if len(batch) > 2 else None
             
             optimizer.zero_grad()
             
@@ -116,7 +115,7 @@ def train_smmd_with_val(model, dataset, epochs, device, batch_size=BATCH_SIZE, l
                 z = torch.randn(x_batch.size(0), SMMD_M, model.d, device=device)
                 theta_fake = model(x_batch, z)
                 
-                loss = sliced_mmd_loss(theta_batch, theta_fake, num_slices=SMMD_L, n_points=SMMD_M, weights=weights_batch)
+                loss = sliced_mmd_loss(theta_batch, theta_fake, num_slices=SMMD_L, n_time_steps=N_TIME_STEPS)
                 
                 loss.backward()
                 optimizer.step()
@@ -133,12 +132,11 @@ def train_smmd_with_val(model, dataset, epochs, device, batch_size=BATCH_SIZE, l
             for batch in val_loader:
                 x_batch = batch[0].to(device)
                 theta_batch = batch[1].to(device)
-                weights_batch = batch[2].to(device) if len(batch) > 2 else None
                 
                 z = torch.randn(x_batch.size(0), SMMD_M, model.d, device=device)
                 theta_fake = model(x_batch, z)
                 
-                loss = sliced_mmd_loss(theta_batch, theta_fake, num_slices=SMMD_L, n_points=SMMD_M, weights=weights_batch)
+                loss = sliced_mmd_loss(theta_batch, theta_fake, num_slices=SMMD_L, n_time_steps=N_TIME_STEPS)
                 val_epoch_loss += loss.item()
         
         avg_val_loss = val_epoch_loss / len(val_loader)
@@ -211,9 +209,6 @@ def main():
             theta_pool = theta_new
             x_pool = x_new
             
-            # Weights are all 1.0 for initial round (or 1/Vol, but normalized 1 is fine)
-            weights_pool = np.ones(len(theta_pool), dtype=np.float32)
-            
         else:
             # Subsequent Rounds
             # N_new = Current Pool Size (Doubling)
@@ -253,22 +248,11 @@ def main():
             # Avoid division by zero
             kde_density = np.clip(kde_density, 1e-12, None)
             
-            # Unnormalized weights (since p(theta) is const)
-            weights_pool = 1.0 / kde_density
-            
-            # Normalize weights to sum to N (or mean 1) to keep loss magnitude similar?
-            # Ideally mean weight should be 1.
-            weights_pool /= np.mean(weights_pool)
-            
-            # Diagnostics
-            print(f"Weights stats: Min={weights_pool.min():.4f}, Max={weights_pool.max():.4f}, Mean={weights_pool.mean():.4f}")
+            pass
 
-        # 2. Train
-        # Create TensorDataset
         dataset = TensorDataset(
             torch.from_numpy(x_pool).float(),
-            torch.from_numpy(theta_pool).float(),
-            torch.from_numpy(weights_pool).float()
+            torch.from_numpy(theta_pool).float()
         )
         
         # Train

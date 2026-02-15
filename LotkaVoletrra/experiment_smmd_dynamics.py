@@ -30,7 +30,7 @@ DATASET_SIZE = 12800
 BATCH_SIZE = CONFIG.get("batch_size", 128)
 N_TIME_STEPS = CONFIG.get("n_time_steps", 151)
 DT = CONFIG.get("dt", 0.2)
-LEARNING_RATE = CONFIG.get("learning_rate", 1e-3)
+LEARNING_RATE = CONFIG.get("learning_rate", 3e-4)
 
 # SMMD Config
 SMMD_MMD_CONFIG = CONFIG.get("smmd_mmd_config", {"M": 50, "L": 20})
@@ -58,7 +58,7 @@ def train_smmd_dynamics(model, train_loader, epochs, device, x_obs, theta_true, 
     """
     Train SMMD model and sample posterior every 50 epochs.
     """
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scheduler = get_scheduler(optimizer, epochs)
     
     model.to(device)
@@ -80,7 +80,6 @@ def train_smmd_dynamics(model, train_loader, epochs, device, x_obs, theta_true, 
         for batch in train_loader:
             x_batch = batch[0].to(device)
             theta_batch = batch[1].to(device)
-            weights_batch = batch[2].to(device) if len(batch) > 2 else None
             
             optimizer.zero_grad()
             
@@ -91,8 +90,7 @@ def train_smmd_dynamics(model, train_loader, epochs, device, x_obs, theta_true, 
                 # Forward
                 theta_fake = model(x_batch, z)
                 
-                # Loss
-                loss = sliced_mmd_loss(theta_batch, theta_fake, num_slices=L, n_points=M, weights=weights_batch)
+                loss = sliced_mmd_loss(theta_batch, theta_fake, num_slices=L, n_time_steps=N_TIME_STEPS)
                 
                 loss.backward()
                 optimizer.step()

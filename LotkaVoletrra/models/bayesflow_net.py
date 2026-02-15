@@ -121,9 +121,9 @@ class TimeSeriesSummary(keras.Model):
     def __init__(self, input_dim, output_dim=10, hidden_dim=64, **kwargs):
         super().__init__(**kwargs)
         # 1D CNN for Time Series Summary (MPS compatible)
-        self.conv1 = keras.layers.Conv1D(filters=hidden_dim, kernel_size=5, padding="same", activation="relu")
+        self.conv1 = keras.layers.Conv1D(filters=hidden_dim, kernel_size=10, padding="same", activation="relu")
         self.pool1 = keras.layers.MaxPooling1D(pool_size=2)
-        self.conv2 = keras.layers.Conv1D(filters=hidden_dim*2, kernel_size=5, padding="same", activation="relu")
+        self.conv2 = keras.layers.Conv1D(filters=hidden_dim*2, kernel_size=10, padding="same", activation="relu")
         self.global_pool = keras.layers.GlobalAveragePooling1D()
         self.dense = keras.layers.Dense(output_dim)
         

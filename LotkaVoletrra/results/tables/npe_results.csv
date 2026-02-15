@@ -1,2 +1,2 @@
-round,status,stage,bias_l2,hdi_length,coverage,time_initial,time_refined_plus,time_mcmc,bias_vec,hdi_lower,hdi_upper,training_time,sampling_time
-1,1,initial,0.47211965344499945,[1.3851011  1.2877593  3.3975246  0.68249893],[1. 1. 1. 1.],0:00:00,0:00:00,0:00:00,[ 0.18840164  0.07272446 -0.42670369  0.00607484],[-4.9398227 -1.3016589 -2.985865  -4.9626513],[-3.5547216  -0.01389953  0.41165954 -4.2801523 ],0.0,428.81120204925537
+round,status,stage,bias_l2,hdi_length,coverage,time_initial,time_refined_plus,time_mcmc,bias_vec,hdi_lower,hdi_upper,training_time,sampling_time,bias_l2_initial,hdi_length_initial,coverage_initial
+1,1,initial,0.8777319557332928,[1.778755  2.1096354 5.272848  1.7551239],[1. 1. 1. 1.],0:00:17,0:00:00,0:00:00,[ 0.52285474  0.40173825 -0.54393619  0.19943946],[-4.895588  -1.3485547 -3.7616177 -4.974511 ],[-3.116833   0.7610805  1.5112306 -3.2193873],0.0,17.20013427734375,0.8777319557332928,[1.778755  2.1096354 5.272848  1.7551239],[1. 1. 1. 1.]
