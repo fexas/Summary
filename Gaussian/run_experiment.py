@@ -48,13 +48,14 @@ except ImportError:
 # 1. Hyperparameters & Device
 # ============================================================================
 # Default values, will be overridden by config.json if available
-M = 50      # MMD approximation samples
-L = 20      # Slicing directions (for SMMD)
+M = 50
+L = 20
 BATCH_SIZE = 256
 DATASET_SIZE = 25600
 LEARNING_RATE = 1e-3
-NUM_ROUNDS = 5 # Default number of rounds
-n = 50 # Default observation size, will be updated from config
+L1_LAMBDA = 1e-4
+NUM_ROUNDS = 5
+n = 50
 
 # Load Configuration from JSON
 CONFIG_PATH = "config.json"
@@ -101,8 +102,7 @@ def get_scheduler(optimizer, epochs):
     return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0)
 
 def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd"):
-    """Training loop for SMMD and MMD models."""
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scheduler = get_scheduler(optimizer, epochs)
     
     model.to(device)
@@ -126,21 +126,22 @@ def train_smmd_mmd(model, train_loader, epochs, device, model_type="smmd"):
             optimizer.zero_grad()
             
             with torch.enable_grad():
-                # Generate fake parameters
-                # Sample Z: (batch, M, d)
                 z = torch.randn(x_batch.size(0), M, model.d, device=device)
                 
-                # Forward pass
-                # Note: SMMD_Model forward takes (x, z) and returns theta_fake
                 theta_fake = model(x_batch, z)
                 
-                # Compute Loss
                 if model_type == "smmd":
                     loss = sliced_mmd_loss(theta_batch, theta_fake, num_slices=L, n_points=M)
                 elif model_type == "mmd":
                     loss = mmd_loss(theta_batch, theta_fake, n_points=M)
                 else:
                     raise ValueError(f"Unknown model type: {model_type}")
+                
+                if hasattr(model, "G"):
+                    l1_loss = 0.0
+                    for param in model.G.parameters():
+                        l1_loss = l1_loss + torch.sum(torch.abs(param))
+                    loss = loss + L1_LAMBDA * l1_loss
                 
                 loss.backward()
                 optimizer.step()
@@ -400,23 +401,21 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
     elif model_type == "w2abc":
         print("W2-ABC does not require neural network training. Proceeding to inference...")
         loss_history = []
-    elif model_type == "snpe_a":
-        # SNPE-A runs training and sampling together
-        # Get sbi_rounds from global config if available, else default to 2
+    elif model_type in ["snpe_a", "npe", "snpe", "snpe_c"]:
+        # NPE / SNPE 系列使用 sbi，一步完成训练+采样
         sbi_rounds = config.get("sbi_rounds", 2) if "config" in globals() else 2
-        
         posterior_samples = run_sbi_model(
-            model_type="snpe_a",
-            train_loader=None, # SBI generates its own simulations
+            model_type=model_type,
+            train_loader=None,
             x_obs=x_obs,
             theta_true=theta_true,
             task=task,
-            device=str(device), # sbi expects string or torch.device
+            device=str(device),
             num_rounds=sbi_rounds,
             sims_per_round=1000,
-            max_epochs=epochs
+            max_epochs=epochs,
         )
-        loss_history = [] # SBI wrapper doesn't return loss history yet
+        loss_history = []
             
     if loss_history:
         plot_loss(loss_history, title=f"{model_type.upper()} Loss", round_id=round_id)
@@ -431,7 +430,7 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
         # W2ABC does inference via SMC, which takes time
         posterior_samples = run_w2abc(task, x_obs, n_samples=n_samples, max_populations=2) 
         model = "W2ABC_SMC_Sampler" # Placeholder
-    elif model_type == "snpe_a":
+    elif model_type in ["snpe_a", "npe", "snpe", "snpe_c"]:
         # Already sampled in training step
         pass
     elif model_type == "dnnabc":
@@ -482,12 +481,11 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
     
     # 3. Local Refinement
     refined_samples_flat = None
+    refinement_time = 0.0
     
-    if model_type in ["dnnabc", "w2abc", "snpe_a"]:
+    if model_type in ["dnnabc", "w2abc", "snpe_a", "npe", "snpe", "snpe_c"]:
         print(f"--- Skipping Local Refinement for {model_type} (as requested) ---")
-        refined_samples_flat = posterior_samples # Use amortized/SMC samples as final
-        
-        # For these models, we only care about total time
+        refined_samples_flat = posterior_samples
         total_time = time.time() - t_start_total
     else:
         print(f"--- Local Refinement ({model_type}) ---")
@@ -597,6 +595,7 @@ def main():
     
     # Store all results for final CSV
     all_results = []
+    model_results_table = {}
     
     print(f"Starting Multi-Round Experiment (Total Rounds: {NUM_ROUNDS})")
 
@@ -697,17 +696,16 @@ def main():
                 round_samples_for_plot[model_type] = result["amortized_samples"]
                 
             # Compute MMD Metrics
-            mmd_amortized = 0.0
-            mmd_refined = 0.0
+            mmd_amortized = np.nan
+            mmd_refined = np.nan
             
             if pymc_samples is not None:
-                # Amortized MMD
                 if result["amortized_samples"] is not None:
                     mmd_amortized = compute_mmd_metric(result["amortized_samples"], pymc_samples)
                     print(f"MMD ({model_type} Amortized): {mmd_amortized:.4f}")
                     
-                # Refined MMD
-                if result["refined_samples"] is not None:
+                # Refined MMD（仅对有Refine的模型计算）
+                if model_type in ["smmd", "mmd", "bayesflow"] and result["refined_samples"] is not None:
                     mmd_refined = compute_mmd_metric(result["refined_samples"], pymc_samples)
                     print(f"MMD ({model_type} Refined): {mmd_refined:.4f}")
             else:
@@ -728,7 +726,12 @@ def main():
             }
             all_results.append(record)
             
-            # Save CSV incrementally (optional, but good for safety)
+            # Per-model result table（LotkaVolterra 风格）
+            if model_type not in model_results_table:
+                model_results_table[model_type] = []
+            model_results_table[model_type].append(record)
+            
+            # Save CSV incrementally（调试用）
             pd.DataFrame(all_results).to_csv("results/experiment_results.csv", index=False)
             
         # End of Model Loop - Plot Combined Posteriors
@@ -736,36 +739,61 @@ def main():
         combined_plot_dir = f"results/plots/round_{round_idx}"
         plot_combined_posteriors(round_samples_for_plot, theta_true, combined_plot_dir, "combined_posteriors.png")
     
-    # 4. Summary Statistics
+    # 4. Summary Statistics（LotkaVolterra 风格，仅基于 MMD）
     print("\n=== Experiment Summary ===")
-    if not all_results:
+    if not model_results_table:
         print("Warning: No results to summarize.")
     else:
-        df = pd.DataFrame(all_results)
+        os.makedirs("results/tables", exist_ok=True)
+        summary_rows = []
         
-        # Calculate Mean and Median
-        if "model_name" in df.columns:
-            summary_mean = df.groupby("model_name").mean(numeric_only=True)
-            summary_median = df.groupby("model_name").median(numeric_only=True)
+        for model_name, rows in model_results_table.items():
+            if not rows:
+                continue
             
-            # Drop 'round' column if present in summary (it's averaged, so maybe not useful)
-            if "round" in summary_mean.columns:
-                summary_mean = summary_mean.drop(columns=["round"])
-            if "round" in summary_median.columns:
-                summary_median = summary_median.drop(columns=["round"])
+            df_model = pd.DataFrame(rows)
+            table_path = f"results/tables/{model_name}_results.csv"
+            df_model.to_csv(table_path, index=False)
+            print(f"Saved per-round table for {model_name} to {table_path}")
             
-            print("Mean Metrics:")
-            print(summary_mean)
-            print("\nMedian Metrics:")
-            print(summary_median)
+            per_round_rows = []
+            for r in rows:
+                per_round_rows.append({
+                    "round": r["round"],
+                    "MMD_Amortized": r.get("mmd_amortized", np.nan),
+                    "MMD_Refined": r.get("mmd_refined", np.nan),
+                })
             
-            # Save Summary
-            os.makedirs("results", exist_ok=True)
-            summary_mean.to_csv("results/summary_mean.csv")
-            summary_median.to_csv("results/summary_median.csv")
+            model_dir = f"results/models/{model_name}"
+            os.makedirs(model_dir, exist_ok=True)
+            per_round_df = pd.DataFrame(per_round_rows)
+            per_round_metrics_path = f"{model_dir}/{model_name}_per_round_metrics.csv"
+            per_round_df.to_csv(per_round_metrics_path, index=False)
+            print(f"Saved per-round metrics for {model_name} to {per_round_metrics_path}")
+            
+            mmd_am_vals = per_round_df["MMD_Amortized"].dropna().values
+            mmd_ref_vals = per_round_df["MMD_Refined"].dropna().values
+            
+            mmd_am_mean = float(np.mean(mmd_am_vals)) if len(mmd_am_vals) > 0 else np.nan
+            mmd_am_median = float(np.median(mmd_am_vals)) if len(mmd_am_vals) > 0 else np.nan
+            mmd_ref_mean = float(np.mean(mmd_ref_vals)) if len(mmd_ref_vals) > 0 else np.nan
+            mmd_ref_median = float(np.median(mmd_ref_vals)) if len(mmd_ref_vals) > 0 else np.nan
+            
+            summary_rows.append({
+                "Model": model_name,
+                "MMD_Amortized_Mean": mmd_am_mean,
+                "MMD_Amortized_Median": mmd_am_median,
+                "MMD_Refined_Mean": mmd_ref_mean,
+                "MMD_Refined_Median": mmd_ref_median,
+            })
+        
+        if summary_rows:
+            df_summary = pd.DataFrame(summary_rows)
+            summary_path = "results/final_summary.csv"
+            df_summary.to_csv(summary_path, index=False)
+            print(f"Saved final summary to {summary_path}")
         else:
-            print("Error: 'model_name' column missing in results DataFrame.")
-            print(df.head())
+            print("No valid summary rows were generated.")
     
     print("\nAll Experiments Completed. Results saved to 'results/' directory.")
 

@@ -1,7 +1,7 @@
 {
     "n_time_steps": 151,
     "dt": 0.2,
-    "num_rounds": 1,
+    "num_rounds": 100,
     "dataset_size": 6400,
     "val_size": 100,
     "batch_size": 128,

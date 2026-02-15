@@ -2,6 +2,25 @@
 import torch
 import torch.nn as nn
 
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-8):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        rms = x.pow(2).mean(dim=-1, keepdim=True)
+        rms = (rms + self.eps).rsqrt()
+        return x * rms * self.weight
+
+
+def _init_normal_0_2(module):
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=0.2)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
 class InvariantModule(nn.Module):
     def __init__(self, settings):
         super().__init__()
@@ -83,46 +102,40 @@ class SummaryNet(nn.Module):
         settings_l2["input_dim"] = self.equiv1.output_dim
         self.equiv2 = EquivariantModule(settings_l2)
         
-        # Layer 3: Invariant (update input dim)
         settings_l3 = settings.copy()
         settings_l3["input_dim"] = self.equiv2.output_dim
         self.inv = InvariantModule(settings_l3)
-        
-        # Output Layer
+        self.post_pool_norm = RMSNorm(self.inv.output_dim)
         self.out_layer = nn.Linear(self.inv.output_dim, output_dim)
+        self.apply(_init_normal_0_2)
         
     def forward(self, x):
-        # x: (batch, n_points, input_dim)
         x = self.equiv1(x)
         x = self.equiv2(x)
         x = self.inv(x)
+        x = self.post_pool_norm(x)
         return self.out_layer(x)
 
 class Generator(nn.Module):
     def __init__(self, z_dim=5, stats_dim=10, out_dim=5):
         super().__init__()
         input_dim = z_dim + stats_dim
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, out_dim)
-        )
+        layers = []
+        in_dim = input_dim
+        hidden_dim = 64
+        for _ in range(3):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(RMSNorm(hidden_dim))
+            layers.append(nn.ReLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, out_dim))
+        self.net = nn.Sequential(*layers)
+        self.apply(_init_normal_0_2)
         
     def forward(self, z, stats):
-        # z: (batch, M, z_dim)
-        # stats: (batch, stats_dim)
-        
-        # Expand stats: (batch, M, stats_dim)
         stats_exp = stats.unsqueeze(1).expand(-1, z.size(1), -1)
-        
-        # Concat: (batch, M, z_dim + stats_dim)
         gen_input = torch.cat([z, stats_exp], dim=-1)
-        
-        return self.net(gen_input) # (batch, M, out_dim)
+        return self.net(gen_input)
 
 class SMMD_Model(nn.Module):
     def __init__(self, summary_dim=10, d=5, d_x=3, n=50):
