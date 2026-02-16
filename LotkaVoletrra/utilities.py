@@ -40,7 +40,8 @@ def run_mcmc_refinement(current_theta, x_obs_stats, task,
     # Initial Log Probabilities
     current_log_prior = log_prior_fn(current_theta)
     current_likelihood = likelihood_fn(current_theta, x_obs_stats)
-    current_prob = np.exp(current_log_prior) * current_likelihood
+    current_log_likelihood = np.log(current_likelihood + 1e-300)
+    current_log_prob = current_log_prior + current_log_likelihood
     
     samples = []
     total_accepted = 0
@@ -59,19 +60,17 @@ def run_mcmc_refinement(current_theta, x_obs_stats, task,
         # Proposed Log Prob
         proposed_log_prior = log_prior_fn(proposed_theta)
         proposed_likelihood = likelihood_fn(proposed_theta, x_obs_stats)
-        proposed_prob = np.exp(proposed_log_prior) * proposed_likelihood
+        proposed_log_likelihood = np.log(proposed_likelihood + 1e-300)
+        proposed_log_prob = proposed_log_prior + proposed_log_likelihood
         
-        # Acceptance Probability
-        ratio = np.divide(proposed_prob, current_prob, out=np.zeros_like(current_prob), where=current_prob!=0)
-        accept_prob = np.minimum(1.0, ratio)
-        
-        # Random Uniform
-        u = np.random.rand(n_chains)
-        accept_mask = u < accept_prob
+        # Acceptance in log space
+        log_ratio = proposed_log_prob - current_log_prob
+        log_u = np.log(np.random.rand(n_chains))
+        accept_mask = log_u < log_ratio
         
         # Update
         current_theta[accept_mask] = proposed_theta[accept_mask]
-        current_prob[accept_mask] = proposed_prob[accept_mask]
+        current_log_prob[accept_mask] = proposed_log_prob[accept_mask]
         
         if step > burn_in:
             total_accepted += np.sum(accept_mask)
@@ -145,7 +144,7 @@ def approximate_likelihood_core(theta, x_obs_stats, task, stats_fn, epsilon, dev
 # SMMD/MMD Implementation
 # =============================================================================
 
-def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.005, device=None):
+def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.01, device=None):
     if device is None:
         # Try to infer device from model parameters
         try:

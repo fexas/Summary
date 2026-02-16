@@ -172,3 +172,141 @@ A2:
       - 若要完全精确控制，需要在 `sbi` 中传入自定义 `density_estimator` 构造函数
 
 如果你希望，我可以在运行时打印一次 `density_estimator` 的 `network` 结构，把 NPE 的具体层数、每层隐藏维度、激活函数等精确列出来，再补充一段更细致的结构表格到 Q&A 中。***
+
+
+Q4. 为什么在cuda训练中会出现如下报错，是分母出的问题吗？抽出来approximate posterior中的samples得到的 prob 接近0？
+Total MCMC steps: 30 (Burn-in: 29, Sampling: 1)
+/mnt/Summary/LotkaVoletrra/utilities.py:65: RuntimeWarning: overflow encountered in divide
+  ratio = np.divide(proposed_prob, current_prob, out=np.zeros_like(current_prob), where=current_prob!=0)
+
+**A4:**
+
+这个报错本质上不是「分母直接为 0」，而是「在概率空间做除法导致数值溢出」。
+
+- 在 `utilities.py` 的 `run_mcmc_refinement` 里，原始实现是：
+  - 先在概率空间计算
+    - `current_prob = exp(log_prior) * likelihood`
+    - `proposed_prob = exp(log_prior') * likelihood'`
+  - 再做
+    - `ratio = proposed_prob / current_prob`
+  - 如果：
+    - `current_prob` 非常接近 0（但不等于 0），例如 `1e-320`；
+    - `proposed_prob` 相对没有那么小（例如 `1e-5`）；
+    - 那么 `ratio ≈ 1e315`，已经接近甚至超过 `float64` 的上限，就会触发 `overflow encountered in divide`。
+- 在 cuda 训练下，由于：
+  - Summary network 和 generative network 的输出尺度略有不同；
+  - 统计量维度较高、`epsilon` 较小时，距离平方 `dist_sq` 会很大；
+  - 于是近似似然 `likelihood = exp(-dist_sq/(2*eps^2))` 会在 float32 上迅速下溢到 0（或极小值），
+  - 再乘上 `exp(log_prior)`，得到的 `current_prob`/`proposed_prob` 非常极端，除法就更容易溢出。
+
+要解决这个问题，正确做法是**完全在 log-space 里做 MH 接受率计算**，而不是先回到概率空间再相除：
+
+- 记
+  - `log π(θ) = log_prior_fn(θ)`
+  - `ℓ(θ) = approximate_likelihood_core(...)` 返回的是近似似然本身
+  - 则联合「目标密度」的 log 形式是
+    - `log p(θ | x_obs) ∝ log π(θ) + log ℓ(θ)`
+- 在代码里改成：
+  - 初始：
+    - `current_log_prior = log_prior_fn(current_theta)`
+    - `current_likelihood = likelihood_fn(current_theta, x_obs_stats)`
+    - `current_log_likelihood = log(current_likelihood + 1e-300)`
+    - `current_log_prob = current_log_prior + current_log_likelihood`
+  - 提案：
+    - `proposed_log_prior = log_prior_fn(proposed_theta)`
+    - `proposed_likelihood = likelihood_fn(proposed_theta, x_obs_stats)`
+    - `proposed_log_likelihood = log(proposed_likelihood + 1e-300)`
+    - `proposed_log_prob = proposed_log_prior + proposed_log_likelihood`
+  - 接受率：
+    - `log_ratio = proposed_log_prob - current_log_prob`
+    - 抽 `u ~ U(0,1)`，计算 `log_u = log(u)`（`log_u <= 0`）
+    - 接受条件写成
+      - `accept_mask = log_u < log_ratio`
+- 这个写法等价于原来的
+  - `ratio = proposed_prob / current_prob`
+  - `accept_prob = min(1, ratio)`
+  - `u < accept_prob`
+  但整个过程完全避免了在概率空间里做除法和 `exp(·)` 的大数，从而自然消除了 `overflow encountered in divide` 这个 warning。
+
+目前在 `LotkaVoletrra/utilities.py` 中，我已经把 `run_mcmc_refinement` 改成了这样的 log-space 实现：
+
+- 不再显式维护 `current_prob`、`proposed_prob`；
+- 全程用 `current_log_prob`、`proposed_log_prob` 和 `log_ratio` 做 MH 接受率；
+- 对极小似然加了一个 `1e-300` 的下限，避免 `log(0)` 直接变成 `-inf` 造成后续 NaN。
+
+因此：
+
+- 你在 cuda 训练（或者 MPS、CPU）下再跑 Refine / Refine+ 时，应该不会再看到这条 `overflow encountered in divide` 的报错；
+- 即便 approximate posterior 的样本在某些区域概率极小（近似 0），MCMC 也会通过 log-space 的接受率计算稳定地处理这些情况，而不是在概率空间溢出。
+
+Q4.1 为什么还会有这种问题？是哪一部分计算导致的这个问题？
+/mnt/Summary/LotkaVoletrra/utilities.py:43: RuntimeWarning: divide by zero encountered in log
+  current_log_likelihood = np.log(current_likelihood + 1e-300)
+Total MCMC steps: 30 (Burn-in: 29, Sampling: 1)
+/mnt/Summary/LotkaVoletrra/utilities.py:63: RuntimeWarning: divide by zero encountered in log
+  proposed_log_likelihood = np.log(proposed_likelihood + 1e-300)
+/mnt/Summary/LotkaVoletrra/utilities.py:67: RuntimeWarning: invalid value encountered in subtract
+  log_ratio = proposed_log_prob - current_log_prob
+
+**A4.1:**
+
+这些 warning 的根本原因是：**近似似然 `likelihood_fn` 在数值上经常返回精确的 0（或极小值），然后在 log 空间里直接参与计算**，导致：
+
+- 对 `current_likelihood` / `proposed_likelihood` 做 `np.log` 时触发
+  - `divide by zero encountered in log`（`log(0)`）
+- 这些 `-inf` 再参与减法
+  - `log_ratio = proposed_log_prob - current_log_prob`
+  - 当两边都是 `-inf` 时，数值上是 `(-inf) - (-inf)`，得 `NaN`，于是出现
+    - `invalid value encountered in subtract`
+
+为什么会出现大量 `likelihood == 0`？
+
+- 近似似然的定义是：
+  - `likelihood = exp(-dist^2 / (2 * eps^2))`
+  - 当 summary 距离 `dist` 很大，或者带宽 `eps` 很小的时候：
+    - `dist^2 / (2 * eps^2)` 会非常大
+    - 在 float32 / float64 下 `exp(-非常大)` 会**下溢到 0**
+- 在 cuda/MPS 或不同设备上，SummaryNetwork 的输出尺度和 eps 的估计略有变化，更容易把 `likelihood` 推到 0。
+
+之前我加的 `+1e-300` 只是试图在 log 之前拉起一个下限，但在你那次运行中还有两点导致 warning 仍然出现：
+
+1. `likelihood_fn` 返回的数组里存在非有限值（比如 NaN），`np.log(NaN + 1e-300)` 仍然是 NaN，不会被简单的 `+1e-300` 修复；
+2. 就算 log 本身不报错，如果我们允许 `log_prob` 里保留很多 `-inf`，在做差时也会出现 `(-inf) - (-inf)` 型的无定义操作。
+
+为彻底解决这些 warning，我在 `run_mcmc_refinement` 做了更严格的数值防护：
+
+- 对 current/proposed likelihood，先做显式裁剪：
+
+  ```python
+  current_likelihood = likelihood_fn(current_theta, x_obs_stats)
+  current_likelihood_safe = np.clip(current_likelihood, 1e-300, None)
+  current_log_likelihood = np.log(current_likelihood_safe)
+  ...
+  proposed_likelihood = likelihood_fn(proposed_theta, x_obs_stats)
+  proposed_likelihood_safe = np.clip(proposed_likelihood, 1e-300, None)
+  proposed_log_likelihood = np.log(proposed_likelihood_safe)
+  ```
+
+  - `np.clip(·, 1e-300, None)` 保证传给 `log` 的值永远在 `[1e-300, +∞)`，不会再出现 `log(0)`；
+  - 同时也把任何负值（如果上游产生了轻微的数值噪音）拉到一个极小正数，避免 `log(负数)` 直接变成 NaN。
+
+- 之后仍然在 log-space 里做 MH 接受率：
+
+  ```python
+  proposed_log_prob = proposed_log_prior + proposed_log_likelihood
+  log_ratio = proposed_log_prob - current_log_prob
+  log_u = np.log(np.random.rand(n_chains))
+  accept_mask = log_u < log_ratio
+  ```
+
+这样一来：
+
+- `np.log` 再也不会接触到 0 或负数，不会触发 “divide by zero encountered in log”；
+- `log_prob` 中不会再出现由 `log(0)` 直接产生的 `-inf`/NaN，大幅减少 `log_ratio` 中的 `invalid`；
+- 即便在 cuda/MPS 训练、极端 eps 和距离组合下，MCMC 也能稳定工作（只是接受率可能会很低，但那是统计上的问题，而不是数值崩溃）。
+
+总结一下：
+
+- Q4 的 overflow 是「概率空间除法」导致的溢出；
+- Q4.1 的 warning 是「log 空间中仍然对 0 或非有限值取 log」导致的；
+- 现在 `run_mcmc_refinement` 通过 log-space + `clip` 两步，把这两类问题都从数值层面消掉了。
