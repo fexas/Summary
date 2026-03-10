@@ -1,2 +1,0 @@
-Model,Bias_Mean,Bias_Median,HDI_Len_Mean,Coverage_Mean,Avg_Time_Initial,Avg_Time_RefinedPlus,Avg_Time_MCMC
-mmd,8.239967374341774,8.239967374341774,8.981444271542758e-06,0.0,0:02:27,0:04:50,0:00:05

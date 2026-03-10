@@ -1,0 +1,50 @@
+{
+    "num_rounds": 100,
+    "N": 1e6,
+    "T_MAX": 160.0,
+    "NUM_OBS": 80,
+    "dataset_size": 2560,
+    "val_size": 100,
+    "batch_size": 128,
+    "learning_rate": 1e-3,
+    "n_samples_posterior": 1000,
+    "models_to_run": [
+        "smmd",
+        "mmd",
+        "bayesflow",
+        "dnnabc"
+    ],
+    "models_config": {
+        "smmd": {
+            "epochs": 25,
+            "summary_dim": 4
+        },
+        "mmd": {
+            "epochs": 25,
+            "summary_dim": 4
+        },
+        "bayesflow": {
+            "epochs": 50,
+            "summary_dim": 4
+        },
+        "dnnabc": {
+            "epochs": 25,
+            "n_pool": 50000
+        },
+        "npe": {
+            "sbi_rounds": 10,
+            "sims_per_round": 6000,
+            "epochs": 100
+        }
+    },
+    "smmd_mmd_config": {
+        "M": 50,
+        "L": 20,
+        "bandwidth_n_samples": 2000
+    },
+    "refinement_config": {
+        "n_chains": 1000,
+        "burn_in": 49,
+        "n_samples_per_chain": 1
+    }
+}

@@ -61,7 +61,7 @@ def train_dnnabc(model, train_loader, epochs, device):
             
     return loss_history
 
-def abc_rejection_sampling(model, x_obs, task, n_samples=1000, batch_size=10000, device="cpu"):
+def abc_rejection_sampling(model, x_obs, task, n_samples=1000, n_pool=100000, batch_size=10000, device="cpu"):
     """
     Perform ABC Rejection Sampling using the trained DNNABC model as summary statistics.
     
@@ -88,27 +88,19 @@ def abc_rejection_sampling(model, x_obs, task, n_samples=1000, batch_size=10000,
     # But usually ABC-Rejection with learned summary stats works by:
     # Simulating N (large) samples, computing distances, taking top k (n_samples).
     
-    N_POOL = 100000
-    
     all_thetas = []
     all_distances = []
     
-    print(f"DNNABC: Simulating {N_POOL} samples for rejection...")
+    print(f"DNNABC: Simulating {n_pool} samples for rejection...")
     
-    # Process in batches
-    num_batches = N_POOL // batch_size
-    
-    for i in range(num_batches):
-        # Sample Prior
-        theta_batch_np = task.sample_prior(batch_size)
+    for i in range(0, n_pool, batch_size):
+        current_batch_size = min(batch_size, n_pool - i)
+        theta_batch_np = task.sample_prior(current_batch_size)
         
-        # Simulate
         x_batch_np = task.simulator(theta_batch_np)
         
-        # To Tensor
         x_batch = torch.from_numpy(x_batch_np).float().to(device)
         
-        # Compute Summary (Prediction)
         with torch.no_grad():
             s_sim = model(x_batch) # (batch, d)
             

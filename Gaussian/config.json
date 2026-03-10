@@ -1,21 +1,60 @@
 {
     "n_observation": 50,
+    "n_observation_list": [25,50,100],
+    "dataset_size": 19200,
+    "batch_size": 128,
+    "learning_rate": 0.001,
+    "n_samples_posterior": 2000,
     "num_rounds": 10,
-    "sbi_rounds": 2,
+    "true_posterior_config": {
+        "method": "mcmc",
+        "n_draws": 1,
+        "n_tune_chain": 5000,
+        "chains": 2000,
+        "proposal_scale": 0.12
+    },
+    "refine_config": {
+        "n_chains": 2000,
+        "burn_in": 99,
+        "thin": 1,
+        "nsims": 1,
+        "epsilon": null
+    },
     "models_to_run": [
-        "snpe_a",
         "smmd",
         "mmd",
         "bayesflow",
         "dnnabc",
-        "w2abc"
+        "npe"
     ],
     "models_config": {
-        "snpe_a": 50,
-        "smmd": 50,
-        "mmd": 50,
-        "bayesflow": 20,
-        "dnnabc": 50,
-        "w2abc": 0
+        "smmd": {
+            "epochs": 200,
+            "summary_dim": 10,
+            "learning_rate": 0.001
+        },
+        "mmd": {
+            "epochs": 200,
+            "summary_dim": 10,
+            "learning_rate": 0.001
+        },
+        "bayesflow": {
+            "epochs": 100,
+            "summary_dim": 10,
+            "learning_rate": 0.001
+        },
+        "dnnabc": {
+            "epochs": 200,
+            "n_pool": 50000,
+            "abc_batch_size": 10000
+        },
+        "npe": {
+            "epochs": 100,
+            "sbi_rounds": 5,
+            "sims_per_round": 10000
+        },
+        "w2abc": {
+            "max_populations": 2
+        }
     }
 }

@@ -87,7 +87,8 @@ def calculate_summary_statistics(x):
     
     return summary_stats
 
-def run_sbi_model(model_type, train_loader, x_obs, theta_true, task, device="cpu", num_rounds=1, sims_per_round=1000, max_epochs=1000, **kwargs):
+def run_sbi_model(model_type, train_loader, x_obs, theta_true, task, device="cpu",
+                  num_rounds=1, sims_per_round=1000, max_epochs=1000, **kwargs):
     """
     Run SBI training and inference using SNPE-A logic.
     
@@ -139,17 +140,23 @@ def run_sbi_model(model_type, train_loader, x_obs, theta_true, task, device="cpu
     # 3. Sequential Inference Loop
     proposal = prior
     
+    initial_training_data = kwargs.pop("initial_training_data", None)
+    
     for r in range(num_rounds):
         print(f"--- SBI Round {r+1}/{num_rounds} ---")
         
-        # A. Simulate Data
-        # Sample theta from proposal
-        theta = proposal.sample((sims_per_round,))
-        
-        # Simulator (wrapper to handle numpy/torch and stats)
-        theta_np = theta.cpu().numpy()
-        x_sim_np = task.simulator(theta_np) # Returns (N, T, D)
-        x_sim_torch = torch.from_numpy(x_sim_np).float()
+        if r == 0 and initial_training_data is not None:
+            x_train_np, theta_train_np = initial_training_data
+            n0 = min(sims_per_round, theta_train_np.shape[0])
+            theta_np = theta_train_np[:n0].astype(np.float32)
+            x_sim_np = x_train_np[:n0].astype(np.float32)
+            theta = torch.from_numpy(theta_np)
+            x_sim_torch = torch.from_numpy(x_sim_np)
+        else:
+            theta = proposal.sample((sims_per_round,))
+            theta_np = theta.cpu().numpy()
+            x_sim_np = task.simulator(theta_np)
+            x_sim_torch = torch.from_numpy(x_sim_np).float()
         
         # Calculate summary stats
         x = calculate_summary_statistics(x_sim_torch)

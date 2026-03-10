@@ -51,6 +51,28 @@ class ToNumpy(Transform):
         """
         return data
 
+class RMSNormLayer(keras.layers.Layer):
+    def __init__(self, eps=1e-8, **kwargs):
+        super().__init__(**kwargs)
+        self.eps = eps
+
+    def build(self, input_shape):
+        dim = input_shape[-1]
+        self.weight = self.add_weight(
+            shape=(dim,),
+            initializer="ones",
+            trainable=True,
+            name="rms_weight",
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        rms = keras.ops.mean(keras.ops.square(x), axis=-1, keepdims=True)
+        rms = keras.ops.rsqrt(rms + self.eps)
+        x_norm = x * rms
+        return x_norm * self.weight
+
+
 # ============================================================================
 # 1. Neural Networks
 # ============================================================================
@@ -59,13 +81,25 @@ class InvariantModule(keras.layers.Layer):
     def __init__(self, settings, **kwargs):
         super().__init__(**kwargs)
         self.s1_layers = []
-        # in_dim = settings["input_dim"] # Not explicitly used for layer creation in Keras 3
+        kernel_init = keras.initializers.RandomNormal(mean=0.0, stddev=0.2)
         for i in range(settings["num_dense_s1"]):
-            self.s1_layers.append(keras.layers.Dense(settings["dense_s1_args"]["units"], activation="relu"))
+            self.s1_layers.append(
+                keras.layers.Dense(
+                    settings["dense_s1_args"]["units"],
+                    activation="relu",
+                    kernel_initializer=kernel_init,
+                )
+            )
         
         self.s2_layers = []
         for i in range(settings["num_dense_s2"]):
-            self.s2_layers.append(keras.layers.Dense(settings["dense_s2_args"]["units"], activation="relu"))
+            self.s2_layers.append(
+                keras.layers.Dense(
+                    settings["dense_s2_args"]["units"],
+                    activation="relu",
+                    kernel_initializer=kernel_init,
+                )
+            )
 
     def call(self, x):
         # x: (batch, n_points, input_dim)
@@ -91,8 +125,15 @@ class EquivariantModule(keras.layers.Layer):
         self.invariant_module = invariant_module
         
         self.s3_layers = []
+        kernel_init = keras.initializers.RandomNormal(mean=0.0, stddev=0.2)
         for i in range(settings["num_dense_s3"]):
-            self.s3_layers.append(keras.layers.Dense(settings["dense_s3_args"]["units"], activation="relu"))
+            self.s3_layers.append(
+                keras.layers.Dense(
+                    settings["dense_s3_args"]["units"],
+                    activation="relu",
+                    kernel_initializer=kernel_init,
+                )
+            )
 
     def call(self, x):
         # x: (batch, n_points, input_dim)
@@ -143,13 +184,15 @@ class DeepSetsSummary(keras.Model):
         settings_l3 = settings.copy()
         settings_l3["input_dim"] = 32 # Output of Equiv2
         self.inv3 = InvariantModule(settings_l3)
-        
-        self.out_layer = keras.layers.Dense(output_dim)
+        self.post_pool_norm = RMSNormLayer()
+        kernel_init = keras.initializers.RandomNormal(mean=0.0, stddev=0.2)
+        self.out_layer = keras.layers.Dense(output_dim, kernel_initializer=kernel_init)
         
     def call(self, x):
         x = self.equiv1(x)
         x = self.equiv2(x)
         x = self.inv3(x)
+        x = self.post_pool_norm(x)
         return self.out_layer(x)
         
     def build(self, input_shape):

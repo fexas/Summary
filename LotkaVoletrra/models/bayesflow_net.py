@@ -59,13 +59,13 @@ class InvariantModule(keras.layers.Layer):
     def __init__(self, settings, **kwargs):
         super().__init__(**kwargs)
         self.s1_layers = []
-        # in_dim = settings["input_dim"] # Not explicitly used for layer creation in Keras 3
+        init = keras.initializers.RandomNormal(mean=0.0, stddev=0.2)
         for i in range(settings["num_dense_s1"]):
-            self.s1_layers.append(keras.layers.Dense(settings["dense_s1_args"]["units"], activation="relu"))
+            self.s1_layers.append(keras.layers.Dense(settings["dense_s1_args"]["units"], activation="relu", kernel_initializer=init))
         
         self.s2_layers = []
         for i in range(settings["num_dense_s2"]):
-            self.s2_layers.append(keras.layers.Dense(settings["dense_s2_args"]["units"], activation="relu"))
+            self.s2_layers.append(keras.layers.Dense(settings["dense_s2_args"]["units"], activation="relu", kernel_initializer=init))
 
     def call(self, x):
         # x: (batch, n_points, input_dim)
@@ -91,8 +91,9 @@ class EquivariantModule(keras.layers.Layer):
         self.invariant_module = invariant_module
         
         self.s3_layers = []
+        init = keras.initializers.RandomNormal(mean=0.0, stddev=0.2)
         for i in range(settings["num_dense_s3"]):
-            self.s3_layers.append(keras.layers.Dense(settings["dense_s3_args"]["units"], activation="relu"))
+            self.s3_layers.append(keras.layers.Dense(settings["dense_s3_args"]["units"], activation="relu", kernel_initializer=init))
 
     def call(self, x):
         # x: (batch, n_points, input_dim)
@@ -117,22 +118,43 @@ class EquivariantModule(keras.layers.Layer):
     def compute_output_shape(self, input_shape):
         return (input_shape[0], input_shape[1], self.s3_layers[-1].units)
 
+class RMSNorm(keras.layers.Layer):
+    def __init__(self, eps=1e-8, **kwargs):
+        super().__init__(**kwargs)
+        self.eps = eps
+        self.weight = None
+
+    def build(self, input_shape):
+        dim = int(input_shape[-1])
+        self.weight = self.add_weight(
+            name="weight",
+            shape=(dim,),
+            initializer="ones",
+            trainable=True,
+        )
+
+    def call(self, x):
+        mean_sq = keras.ops.mean(keras.ops.square(x), axis=-1, keepdims=True)
+        x = x * keras.ops.rsqrt(mean_sq + self.eps)
+        return x * self.weight
+
 class TimeSeriesSummary(keras.Model):
     def __init__(self, input_dim, output_dim=10, hidden_dim=64, **kwargs):
         super().__init__(**kwargs)
-        # 1D CNN for Time Series Summary (MPS compatible)
-        self.conv1 = keras.layers.Conv1D(filters=hidden_dim, kernel_size=5, padding="same", activation="relu")
+        init = keras.initializers.RandomNormal(mean=0.0, stddev=0.2)
+        self.conv1 = keras.layers.Conv1D(filters=hidden_dim, kernel_size=10, padding="same", activation="relu", kernel_initializer=init)
         self.pool1 = keras.layers.MaxPooling1D(pool_size=2)
-        self.conv2 = keras.layers.Conv1D(filters=hidden_dim*2, kernel_size=5, padding="same", activation="relu")
+        self.conv2 = keras.layers.Conv1D(filters=hidden_dim*2, kernel_size=10, padding="same", activation="relu", kernel_initializer=init)
         self.global_pool = keras.layers.GlobalAveragePooling1D()
-        self.dense = keras.layers.Dense(output_dim)
+        self.norm = RMSNorm()
+        self.dense = keras.layers.Dense(output_dim, kernel_initializer=init)
         
     def call(self, x):
-        # x: (batch, time_steps, input_dim)
         x = self.conv1(x)
         x = self.pool1(x)
         x = self.conv2(x)
         x = self.global_pool(x)
+        x = self.norm(x)
         return self.dense(x)
         
     def compute_output_shape(self, input_shape):
@@ -145,7 +167,7 @@ class TimeSeriesSummary(keras.Model):
 class DeepSetsSummary(keras.Model):
     def __init__(self, input_dim, output_dim=10, **kwargs):
         super().__init__(**kwargs)
-        
+        self._init = keras.initializers.RandomNormal(mean=0.0, stddev=0.2)
         settings = dict(
             num_dense_s1=2, num_dense_s2=2, num_dense_s3=2,
             dense_s1_args={"units": 64},
@@ -169,7 +191,7 @@ class DeepSetsSummary(keras.Model):
         settings_l3["input_dim"] = 32 # Output of Equiv2
         self.inv3 = InvariantModule(settings_l3)
         
-        self.out_layer = keras.layers.Dense(output_dim)
+        self.out_layer = keras.layers.Dense(output_dim, kernel_initializer=self._init)
         
     def call(self, x):
         x = self.equiv1(x)

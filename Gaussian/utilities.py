@@ -30,10 +30,10 @@ def run_mcmc_refinement(current_theta, x_obs_stats, task,
     proposal_scale = std_per_dim * proposal_std
     print(f"Proposal Scale (per dim): {proposal_scale}")
     
-    # Initial Log Probabilities
+    # Initial log probabilities: log p(theta | x) = log p(theta) + log p(x | theta)
     current_log_prior = log_prior_fn(current_theta)
     current_likelihood = likelihood_fn(current_theta, x_obs_stats)
-    current_prob = np.exp(current_log_prior) * current_likelihood
+    current_log_prob = current_log_prior + np.log(current_likelihood + 1e-300)
     
     samples = []
     total_accepted = 0
@@ -49,22 +49,19 @@ def run_mcmc_refinement(current_theta, x_obs_stats, task,
         proposal_noise = np.random.randn(n_chains, task.d) * proposal_scale
         proposed_theta = current_theta + proposal_noise
         
-        # Proposed Log Prob
+        # Proposed log prob
         proposed_log_prior = log_prior_fn(proposed_theta)
         proposed_likelihood = likelihood_fn(proposed_theta, x_obs_stats)
-        proposed_prob = np.exp(proposed_log_prior) * proposed_likelihood
+        proposed_log_prob = proposed_log_prior + np.log(proposed_likelihood + 1e-300)
         
-        # Acceptance Probability
-        ratio = np.divide(proposed_prob, current_prob, out=np.zeros_like(current_prob), where=current_prob!=0)
-        accept_prob = np.minimum(1.0, ratio)
-        
-        # Random Uniform
-        u = np.random.rand(n_chains)
-        accept_mask = u < accept_prob
+        # Metropolis-Hastings acceptance in log space
+        log_alpha = proposed_log_prob - current_log_prob
+        u = np.log(np.random.rand(n_chains))
+        accept_mask = u < log_alpha
         
         # Update
         current_theta[accept_mask] = proposed_theta[accept_mask]
-        current_prob[accept_mask] = proposed_prob[accept_mask]
+        current_log_prob[accept_mask] = proposed_log_prob[accept_mask]
         
         if step > burn_in:
             total_accepted += np.sum(accept_mask)
@@ -83,6 +80,80 @@ def run_mcmc_refinement(current_theta, x_obs_stats, task,
     print(f"Refinement Complete. Acceptance Rate: {acceptance_rate:.2%}")
     
     return posterior_samples
+
+def gaussian_log_likelihood(theta, x_obs_2d):
+    theta = np.asarray(theta, dtype=np.float32)
+    if theta.ndim == 1:
+        theta = theta[np.newaxis, :]
+    x = np.asarray(x_obs_2d, dtype=np.float32)
+    if x.ndim != 2 or x.shape[1] != 2:
+        raise ValueError(f"Expected x_obs_2d shape (n, 2), got {x.shape}")
+    n_obs = x.shape[0]
+    m0 = theta[:, 0]
+    m1 = theta[:, 1]
+    s0_param = theta[:, 2]
+    s1_param = theta[:, 3]
+    r_param = theta[:, 4]
+    s0_real = s0_param**2
+    s1_real = s1_param**2
+    rho = np.tanh(r_param)
+    a = s0_real**2
+    c = s1_real**2
+    b = rho * s0_real * s1_real
+    eps = 1e-8
+    det = a * c - b**2
+    det = np.maximum(det, eps)
+    inv00 = c / det
+    inv01 = -b / det
+    inv11 = a / det
+    dx0 = x[:, 0][np.newaxis, :] - m0[:, np.newaxis]
+    dx1 = x[:, 1][np.newaxis, :] - m1[:, np.newaxis]
+    q = inv00[:, np.newaxis] * dx0**2 + 2.0 * inv01[:, np.newaxis] * dx0 * dx1 + inv11[:, np.newaxis] * dx1**2
+    q_sum = np.sum(q, axis=1)
+    log_det = np.log(det)
+    two_log2pi = 2.0 * np.log(2.0 * np.pi)
+    common = two_log2pi + log_det
+    log_likelihood = -0.5 * (n_obs * common + q_sum)
+    return log_likelihood
+
+def run_gaussian_posterior_mcmc(x_obs_2d, task, n_draws=2000, n_tune_chain=1000, chains=4, proposal_scale=0.3):
+    x = np.asarray(x_obs_2d, dtype=np.float32)
+    if x.ndim != 2 or x.shape[1] != 2:
+        raise ValueError(f"Expected x_obs_2d shape (n, 2), got {x.shape}")
+    current_theta = task.sample_prior(chains)
+    current_log_prior = task.log_prior(current_theta)
+    current_log_like = gaussian_log_likelihood(current_theta, x)
+    current_log_post = current_log_prior + current_log_like
+    samples = []
+    total_accepted = 0
+    total_steps = int(n_tune_chain) + int(n_draws)
+    if total_steps <= 0:
+        raise ValueError("Total number of MCMC steps must be positive.")
+    print(f"Starting Gaussian posterior MCMC: chains={chains}, draws={n_draws}, tune={n_tune_chain}")
+    for step in range(total_steps):
+        proposal = current_theta + proposal_scale * np.random.randn(chains, task.d).astype(np.float32)
+        proposed_log_prior = task.log_prior(proposal)
+        proposed_log_like = gaussian_log_likelihood(proposal, x)
+        proposed_log_post = proposed_log_prior + proposed_log_like
+        log_alpha = proposed_log_post - current_log_post
+        u = np.log(np.random.rand(chains))
+        accept_mask = u < log_alpha
+        current_theta[accept_mask] = proposal[accept_mask]
+        current_log_post[accept_mask] = proposed_log_post[accept_mask]
+        if step >= n_tune_chain:
+            samples.append(current_theta.copy())
+            total_accepted += np.sum(accept_mask)
+        if (step + 1) % 50 == 0 or step == total_steps - 1:
+            accepted_frac = np.mean(accept_mask)
+            print(f"Step {step+1}/{total_steps} | Accepted fraction this step: {accepted_frac:.2%}")
+    if not samples:
+        samples.append(current_theta.copy())
+    chain_samples = np.stack(samples, axis=1)
+    flat_samples = chain_samples.reshape(-1, task.d)
+    effective_draws = len(samples)
+    acceptance_rate = total_accepted / (chains * max(effective_draws, 1))
+    print(f"MCMC complete. Stored draws per chain: {effective_draws}, overall acceptance: {acceptance_rate:.2%}")
+    return flat_samples
 
 def compute_bandwidth_core(theta0_np, x_obs_tensor, task, stats_fn, n_samples, quantile_level, device):
     """
@@ -132,7 +203,7 @@ def approximate_likelihood_core(theta, x_obs_stats, task, stats_fn, nsims, epsil
 # SMMD/MMD Implementation
 # =============================================================================
 
-def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.005, device="cpu"):
+def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.025, device="cpu"):
     print("Computing bandwidth for SMMD refinement...")
     x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
     x_obs_batch = x_obs_tensor.expand(n_samples, -1, -1)
@@ -175,7 +246,7 @@ def refine_posterior_smmd(model, x_obs, task,
 # BayesFlow Implementation
 # =============================================================================
 
-def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_level=0.005, device="cpu"):
+def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_level=0.025, device="cpu"):
     print("Computing bandwidth for BayesFlow refinement...")
     x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
     
@@ -342,3 +413,19 @@ def compute_mmd_metric(samples_approx, samples_true):
     
     return mmd_value
 
+def test_gaussian_posterior_mcmc():
+    from data_generation import GaussianTask
+    task = GaussianTask()
+    theta_true, x_obs_3d = task.get_ground_truth()
+    X_comp = x_obs_3d[:, 0]
+    Y_comp = x_obs_3d[:, 1]
+    Z_comp = x_obs_3d[:, 2]
+    denom = 1.0 - Z_comp
+    denom[np.abs(denom) < 1e-6] = 1e-6
+    x_2d = X_comp / denom
+    y_2d = Y_comp / denom
+    x_obs_2d = np.stack([x_2d, y_2d], axis=-1)
+    samples = run_gaussian_posterior_mcmc(x_obs_2d, task, n_draws=200, n_tune_chain=100, chains=16, proposal_scale=0.3)
+    print("MCMC test samples shape:", samples.shape)
+    print("MCMC test sample mean:", np.mean(samples, axis=0))
+    print("Theta true:", theta_true)

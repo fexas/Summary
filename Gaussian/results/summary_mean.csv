@@ -1,2 +1,0 @@
-model_name,training_time,refinement_time,total_time,mmd_amortized,mmd_refined
-smmd,4.863373041152954,26.780783891677856,31.64415693283081,0.652158630914095,0.6498283709934967

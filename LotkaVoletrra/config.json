@@ -1,48 +1,57 @@
 {
     "n_time_steps": 151,
     "dt": 0.2,
-    "num_rounds": 1,
-    "dataset_size": 6400,
+    "num_rounds": 100,
+    "dataset_size": 25600,
     "val_size": 100,
     "batch_size": 128,
-    "learning_rate": 0.001,
+    "learning_rate": 1e-3,
     "n_samples_posterior": 1000,
     "models_to_run": [
-        "mmd"
+        "smmd",
+        "mmd",
+        "bayesflow",
+        "dnnabc",
+        "npe"
     ],
     "models_config": {
-        "smmd": { 
-            "epochs": 250,
+        "smmd": {
+            "epochs": 200,
             "summary_dim": 8,
             "refined_mode": 1,
             "num_refine_rounds": 1
         },
-        "mmd": { 
-            "epochs": 300,
+        "mmd": {
+            "epochs": 200,
             "summary_dim": 8,
             "refined_mode": 1,
             "num_refine_rounds": 1
         },
-        "bayesflow": { 
-            "epochs": 30,
+        "bayesflow": {
+            "epochs": 200,
             "summary_dim": 8,
-            "refined_mode": 1
+            "refined_mode": 1,
+            "refine_dataset_size": 12800
         },
-        "dnnabc": { 
-            "epochs": 500, 
-            "n_pool": 1000 
+        "dnnabc": {
+            "epochs": 400,
+            "train_samples": 25600,
+            "n_pool": 34400
         },
         "w2abc": {
             "max_populations": 2
         },
-        "npe": { 
+        "npe": {
             "sbi_rounds": 10,
-            "sims_per_round": 1000,
-            "epochs": 1000
+            "sims_per_round": 6000,
+            "epochs": 200
         }
     },
     "smmd_mmd_config": {
         "M": 50,
-        "L": 20
+        "L": 20,
+        "initial_train_samples": 12800,
+        "refine_train_samples": 12800,
+        "bandwidth_n_samples": 4400
     }
 }

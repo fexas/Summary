@@ -40,7 +40,8 @@ def run_mcmc_refinement(current_theta, x_obs_stats, task,
     # Initial Log Probabilities
     current_log_prior = log_prior_fn(current_theta)
     current_likelihood = likelihood_fn(current_theta, x_obs_stats)
-    current_prob = np.exp(current_log_prior) * current_likelihood
+    current_log_likelihood = np.log(current_likelihood + 1e-300)
+    current_log_prob = current_log_prior + current_log_likelihood
     
     samples = []
     total_accepted = 0
@@ -59,19 +60,17 @@ def run_mcmc_refinement(current_theta, x_obs_stats, task,
         # Proposed Log Prob
         proposed_log_prior = log_prior_fn(proposed_theta)
         proposed_likelihood = likelihood_fn(proposed_theta, x_obs_stats)
-        proposed_prob = np.exp(proposed_log_prior) * proposed_likelihood
+        proposed_log_likelihood = np.log(proposed_likelihood + 1e-300)
+        proposed_log_prob = proposed_log_prior + proposed_log_likelihood
         
-        # Acceptance Probability
-        ratio = np.divide(proposed_prob, current_prob, out=np.zeros_like(current_prob), where=current_prob!=0)
-        accept_prob = np.minimum(1.0, ratio)
-        
-        # Random Uniform
-        u = np.random.rand(n_chains)
-        accept_mask = u < accept_prob
+        # Acceptance in log space
+        log_ratio = proposed_log_prob - current_log_prob
+        log_u = np.log(np.random.rand(n_chains))
+        accept_mask = log_u < log_ratio
         
         # Update
         current_theta[accept_mask] = proposed_theta[accept_mask]
-        current_prob[accept_mask] = proposed_prob[accept_mask]
+        current_log_prob[accept_mask] = proposed_log_prob[accept_mask]
         
         if step > burn_in:
             total_accepted += np.sum(accept_mask)
@@ -145,7 +144,7 @@ def approximate_likelihood_core(theta, x_obs_stats, task, stats_fn, epsilon, dev
 # SMMD/MMD Implementation
 # =============================================================================
 
-def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.005, device=None):
+def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.01, device=None):
     if device is None:
         # Try to infer device from model parameters
         try:
@@ -178,7 +177,8 @@ def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.
 
 def refine_posterior_smmd(model, x_obs, task, 
                          n_chains=1000, n_samples=1, burn_in=99, 
-                         thin=1, epsilon=None, proposal_std=0.5, device=None, theta_init=None):
+                         thin=1, epsilon=None, proposal_std=0.5, device=None, theta_init=None,
+                         bandwidth_n_samples=5000):
     if device is None:
         try:
             device = next(model.parameters()).device
@@ -188,7 +188,7 @@ def refine_posterior_smmd(model, x_obs, task,
     print(f"Starting SMMD MCMC Refinement (Device: {device})...")
     
     if epsilon is None:
-        epsilon = compute_bandwidth_smmd(model, x_obs, task, device=device)
+        epsilon = compute_bandwidth_smmd(model, x_obs, task, n_samples=bandwidth_n_samples, device=device)
         
     if isinstance(x_obs, torch.Tensor):
         x_obs_tensor = x_obs.float().to(device)
@@ -228,7 +228,8 @@ def refine_posterior_smmd(model, x_obs, task,
 
 def refine_posterior_bayesflow(model, x_obs, task, 
                              n_chains=1000, n_samples=1, burn_in=99, 
-                             thin=1, epsilon=None, proposal_std=0.5, device=None, theta_init=None):
+                             thin=1, epsilon=None, proposal_std=0.5, device=None, theta_init=None,
+                             bandwidth_n_samples=5000):
     if device is None:
         # Infer device from model (Keras model usually manages its own device, but we need it for tensors)
         device = "cpu"
@@ -238,7 +239,7 @@ def refine_posterior_bayesflow(model, x_obs, task,
     
     # 1. Bandwidth
     if epsilon is None:
-        epsilon = compute_bandwidth_bayesflow(model, x_obs, task, device=device)
+        epsilon = compute_bandwidth_bayesflow(model, x_obs, task, n_samples=bandwidth_n_samples, device=device)
         
     # 2. Initial Points
     x_obs_cpu = x_obs if isinstance(x_obs, np.ndarray) else x_obs.cpu().numpy()
@@ -251,13 +252,13 @@ def refine_posterior_bayesflow(model, x_obs, task,
              print(f"Warning: theta_init shape {current_theta.shape} != n_chains {n_chains}. Adjusting n_chains.")
              n_chains = current_theta.shape[0]
     else:
-        # Sample from BayesFlow model
-        # Replicate x_obs for batch sampling
         x_obs_rep = np.tile(x_obs_cpu, (n_chains, 1, 1))
-        
         post = model.sample(conditions={"summary_variables": x_obs_rep}, num_samples=1)
-        if isinstance(post, dict): post = post["inference_variables"]
-        current_theta = post.reshape(n_chains, -1)
+        if isinstance(post, dict):
+            post = post["inference_variables"]
+        if hasattr(post, "numpy"):
+            post = post.numpy()
+        current_theta = np.asarray(post).reshape(n_chains, -1)
         if isinstance(current_theta, torch.Tensor):
             current_theta = current_theta.cpu().numpy()
         
