@@ -30,7 +30,7 @@ d_x = 1
 PRIOR_MIN = np.array([0.01, 0.01])
 PRIOR_MAX = np.array([1.0, 1.0])
 
-TRUE_PARAMS = np.array([0.12, 0.115])  # TRUE_PARAMS = np.array([0.4, 0.1])
+TRUE_PARAMS = np.array([0.20, 0.12])  # TRUE_PARAMS = np.array([0.12, 0.115])
 
 
 def simulator(theta, n_points=NUM_OBS, normalize=True):

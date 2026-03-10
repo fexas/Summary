@@ -266,8 +266,8 @@ def plot_combined_posteriors(all_model_samples, theta_true, output_dir, filename
     # We can let it auto-scale or set reasonable priors.
     # For SIR, usually beta in [0, 2], gamma in [0, 1] roughly.
     x_limits = [
-        [0.0, 1.5],   # beta
-        [0.0, 1.0],   # gamma
+        [0.0, 0.5],   # beta
+        [0.0, 0.3],   # gamma
     ]
     
     # Colors
@@ -330,8 +330,7 @@ def plot_combined_posteriors(all_model_samples, theta_true, output_dir, filename
         else:
             ax.set_ylabel("")
             
-        # Optional x-limits
-        # ax.set_xlim(x_limits[i])
+        ax.set_xlim(x_limits[i])
         
         ax.grid(True, linestyle='--', alpha=0.4, linewidth=1.0)
         
@@ -388,6 +387,11 @@ def plot_all_refinement_comparisons(all_results_dict, theta_true, output_dir):
     # Dimensions to plot
     dims_to_plot = [0, 1]
     param_names = [r"$\beta$", r"$\gamma$"]
+
+    x_limits = [
+        [0.0, 0.5],   # beta
+        [0.0, 0.3],   # gamma
+    ]
     
     # Colors
     colors = {
@@ -464,6 +468,8 @@ def plot_all_refinement_comparisons(all_results_dict, theta_true, output_dir):
             ax.set_ylabel("Density", fontsize=label_fontsize, fontweight='bold')
         else:
             ax.set_ylabel("")
+
+        ax.set_xlim(x_limits[i])
             
         ax.grid(True, linestyle='--', alpha=0.4, linewidth=1.0)
         

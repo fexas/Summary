@@ -226,7 +226,7 @@ def refine_posterior_smmd(
             task,
             stats_fn,
             bandwidth_n_samples,
-            0.01,
+            0.02,
             device,
         )
         print(f"[Refine] Estimated epsilon={epsilon:.4f}")
@@ -353,7 +353,7 @@ def refine_posterior_bayesflow(
 
 
 def compute_bandwidth_bayesflow(
-    model, x_obs, task, n_samples=5000, quantile_level=0.005, device="cpu"
+    model, x_obs, task, n_samples=5000, quantile_level=0.02, device="cpu"
 ):
     theta_prior = task.sample_prior(n_samples)
     x_sim = task.simulator(theta_prior)
