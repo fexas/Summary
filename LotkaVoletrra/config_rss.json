@@ -19,7 +19,7 @@
             "num_refine_rounds": 1
         },
         "mmd": {
-            "epochs": 100,
+            "epochs":100,
             "summary_dim": 8,
             "refined_mode": 1,
             "num_refine_rounds": 1
