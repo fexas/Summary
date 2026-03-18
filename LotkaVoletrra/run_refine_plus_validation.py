@@ -4,9 +4,7 @@ Focus: Validate improvement across Amortized -> Sequential Training -> Refine+ (
 """
 
 import os
-import sys
 import time
-from datetime import timedelta
 import json
 import numpy as np
 import torch
@@ -27,8 +25,7 @@ if "KERAS_BACKEND" not in os.environ:
 # Import from local modules
 from data_generation import LVTask
 from models.smmd import SMMD_Model, sliced_mmd_loss
-from models.sbi_wrappers import run_sbi_model
-from utilities import compute_metrics, fit_kde_and_evaluate, refine_posterior
+from utilities import compute_metrics, refine_posterior
 
 # ============================================================================
 # 1. Configuration & Global Parameters
@@ -87,6 +84,19 @@ N_TIME_STEPS = CONFIG.get("n_time_steps", 151)
 DT = CONFIG.get("dt", 0.2)
 LEARNING_RATE = CONFIG.get("learning_rate", 1e-3)
 N_SAMPLES_POSTERIOR = CONFIG.get("n_samples_posterior", 1000)
+
+if os.environ.get("LV_RSS_QUICK_TEST") == "1":
+    EXPERIMENT_ROUNDS = 1
+    DATASET_SIZE = min(int(DATASET_SIZE), 512)
+    N_SAMPLES_POSTERIOR = min(int(N_SAMPLES_POSTERIOR), 200)
+    model_conf_smmd = dict(MODELS_CONFIG.get("smmd", {}))
+    model_conf_smmd["epochs"] = min(int(model_conf_smmd.get("epochs", 200)), 20)
+    MODELS_CONFIG = dict(MODELS_CONFIG)
+    MODELS_CONFIG["smmd"] = model_conf_smmd
+    BATCH_SIZE = min(int(BATCH_SIZE), 128)
+    SMMD_INITIAL_TRAIN_SAMPLES = min(int(SMMD_INITIAL_TRAIN_SAMPLES), DATASET_SIZE)
+    SMMD_REFINE_TRAIN_SAMPLES = min(int(SMMD_REFINE_TRAIN_SAMPLES), DATASET_SIZE)
+    BANDWIDTH_N_SAMPLES = min(int(BANDWIDTH_N_SAMPLES), 1000)
 
 # Task Dimensions
 d = 4 # alpha, beta, gamma, delta
@@ -189,32 +199,22 @@ def plot_three_stage_comparison(samples_dict, theta_true, output_dir, round_idx)
     
     # Define colors/styles for stages
     # Distinct colors: Amortized (Blue), Sequential (Orange), Refined+ (Green)
-    # NPE: Purple
-    # True Value: Black dashed
+    # True Value: Red solid
     styles = {
         'Amortized': {'color': '#1f77b4', 'linestyle': '--', 'label': 'Amortized', 'alpha': 1.0, 'linewidth': 3.5, 'fill': False},
         'Sequential': {'color': '#ff7f0e', 'linestyle': '-.', 'label': 'Sequential', 'alpha': 1.0, 'linewidth': 3.5, 'fill': False},
         'Refined+ (MCMC)': {'color': '#2ca02c', 'linestyle': '-', 'label': 'Refined+ (MCMC)', 'alpha': 0.2, 'linewidth': 4.5, 'fill': True},
-        'NPE': {'color': '#9467bd', 'linestyle': '-', 'label': 'NPE', 'alpha': 0.15, 'linewidth': 3.5, 'fill': True}
     }
-    
-    # X limits for each parameter
-    x_limits = [
-        [-7.0, -3.0],  # theta_1
-        [-2.0, 2.0],  # theta_2
-        [-2.0, 2.0],  # theta_3
-        [-7.0, -3.0]   # theta_4
-    ]
     
     for i in range(cols):
         ax = axes[i]
-        param_symbol = rf'$\theta_{{{i+1}}}$'
+        param_symbol = rf'$\log(\theta_{{{i+1}}})$'
         
         for label, samples in samples_dict.items():
             if samples is not None:
                 style = styles.get(label, {})
                 sns.kdeplot(
-                    x=samples[:, i], 
+                    x=np.asarray(samples[:, i], dtype=float), 
                     ax=ax, 
                     fill=style.get('fill', False), 
                     alpha=style.get('alpha', 1.0),
@@ -225,12 +225,17 @@ def plot_three_stage_comparison(samples_dict, theta_true, output_dir, round_idx)
                 )
             
         if i < len(theta_true):
-            ax.axvline(x=theta_true[i], color='black', linestyle=':', linewidth=3.5, label='True Value')
+            ax.axvline(x=float(theta_true[i]), color='#FA0101', linestyle='-', linewidth=4.5, label='True Value')
             
         ax.set_title(f'{param_symbol}', fontsize=title_fontsize, fontweight='bold', pad=15)
         ax.tick_params(axis='both', which='major', labelsize=tick_labelsize, width=2, length=6)
-        
-        # Set X limits
+
+        x_limits = [
+            (-7.0, -3.0),
+            (-2.0, 2.0),
+            (-2.0, 2.0),
+            (-7.0, -3.0),
+        ]
         if i < len(x_limits):
             ax.set_xlim(x_limits[i])
         
@@ -251,7 +256,7 @@ def plot_three_stage_comparison(samples_dict, theta_true, output_dir, round_idx)
     by_label = dict(zip(labels, handles))
     
     # Desired order
-    order = ["Amortized", "Sequential", "Refined+ (MCMC)", "NPE", "True Value"]
+    order = ["Amortized", "Sequential", "Refined+ (MCMC)", "True Value"]
     sorted_handles = []
     sorted_labels = []
     
@@ -396,8 +401,7 @@ def run_experiment_round(round_idx, task, x_obs, theta_true, train_loader, x_tra
     # --- Stage 3: MCMC Refinement ---
     print("\n--- Stage 3: MCMC Refinement ---")
     
-    mcmc_burn_in = model_conf.get("mcmc_burn_in", 69) # From config or default
-    # Note: run_experiment.py used 29 burn-in for small n_samples test, let's stick to config or default
+    mcmc_burn_in = model_conf.get("mcmc_burn_in", 29) # From config or default
     
     # Use Sequential samples as initialization
     theta_init_mcmc = theta_sequential
@@ -418,41 +422,6 @@ def run_experiment_round(round_idx, task, x_obs, theta_true, train_loader, x_tra
     results["metrics"]["refined"] = metrics_refined
     results["samples"]["Refined+ (MCMC)"] = theta_refined
     print(f"Refined+ Bias L2: {metrics_refined['bias_l2']:.4f}")
-    
-    # --- Stage 4: NPE (Reference) ---
-    print("\n--- Stage 4: NPE (Reference) ---")
-    
-    npe_conf = MODELS_CONFIG.get("npe", {})
-    num_rounds = npe_conf.get("sbi_rounds", 5)
-    sims_per_round = npe_conf.get("sims_per_round", 1280)
-    max_epochs = npe_conf.get("epochs", 70)
-    
-    # Ensure npe config exists
-    if not npe_conf:
-        # Fallback if not in config
-        num_rounds = 5
-        sims_per_round = 1280
-        max_epochs = 70
-        print("Using default NPE config.")
-        
-    try:
-        theta_npe = run_sbi_model(
-            "npe", train_loader, x_obs, theta_true, task,
-            device=DEVICE, num_rounds=num_rounds,
-            sims_per_round=sims_per_round, max_epochs=max_epochs,
-            initial_training_data=(x_train, theta_train)
-        )
-        
-        metrics_npe = compute_metrics(theta_npe, theta_true)
-        results["metrics"]["npe"] = metrics_npe
-        results["samples"]["NPE"] = theta_npe
-        print(f"NPE Bias L2: {metrics_npe['bias_l2']:.4f}")
-    except Exception as e:
-        print(f"NPE failed: {e}")
-        import traceback
-        traceback.print_exc()
-        results["metrics"]["npe"] = {"bias_l2": np.nan, "hdi_length": np.nan, "coverage": np.nan}
-        results["samples"]["NPE"] = None
     
     return results
 
@@ -498,7 +467,7 @@ def main():
         
         # Collect Metrics
         metrics_row = {"round": round_idx}
-        for stage in ["amortized", "sequential", "refined", "npe"]:
+        for stage in ["amortized", "sequential", "refined"]:
             m = res["metrics"].get(stage)
             if m:
                 metrics_row[f"bias_l2_{stage}"] = m["bias_l2"]

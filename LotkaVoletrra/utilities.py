@@ -37,11 +37,14 @@ def run_mcmc_refinement(current_theta, x_obs_stats, task,
     proposal_scale = std_per_dim * proposal_std
     print(f"Proposal Scale (per dim): {proposal_scale}")
     
-    # Initial Log Probabilities
     current_log_prior = log_prior_fn(current_theta)
-    current_likelihood = likelihood_fn(current_theta, x_obs_stats)
-    current_log_likelihood = np.log(current_likelihood + 1e-300)
-    current_log_prob = current_log_prior + current_log_likelihood
+    current_log_prob = np.full(n_chains, -np.inf, dtype=np.float64)
+    valid_mask_curr = np.isfinite(current_log_prior)
+    if np.any(valid_mask_curr):
+        theta_valid_curr = current_theta[valid_mask_curr]
+        lik_valid_curr = likelihood_fn(theta_valid_curr, x_obs_stats)
+        log_lik_valid_curr = np.log(lik_valid_curr + 1e-300)
+        current_log_prob[valid_mask_curr] = current_log_prior[valid_mask_curr] + log_lik_valid_curr
     
     samples = []
     total_accepted = 0
@@ -59,12 +62,16 @@ def run_mcmc_refinement(current_theta, x_obs_stats, task,
         
         # Proposed Log Prob
         proposed_log_prior = log_prior_fn(proposed_theta)
-        proposed_likelihood = likelihood_fn(proposed_theta, x_obs_stats)
-        proposed_log_likelihood = np.log(proposed_likelihood + 1e-300)
-        proposed_log_prob = proposed_log_prior + proposed_log_likelihood
+        proposed_log_prob = np.full(n_chains, -np.inf, dtype=np.float64)
+        valid_mask = np.isfinite(proposed_log_prior)
+        if np.any(valid_mask):
+            theta_valid = proposed_theta[valid_mask]
+            lik_valid = likelihood_fn(theta_valid, x_obs_stats)
+            log_lik_valid = np.log(lik_valid + 1e-300)
+            proposed_log_prob[valid_mask] = proposed_log_prior[valid_mask] + log_lik_valid
         
-        # Acceptance in log space
         log_ratio = proposed_log_prob - current_log_prob
+        log_ratio = np.where(np.isfinite(log_ratio), log_ratio, -np.inf)
         log_u = np.log(np.random.rand(n_chains))
         accept_mask = log_u < log_ratio
         
@@ -96,6 +103,7 @@ def compute_bandwidth_core(theta0_np, x_obs_tensor, task, stats_fn, n_samples, q
     """
     # Simulate Data from Theta0
     # Note: task.simulator in LV returns (batch, n_obs, 2)
+    theta0_np = np.clip(theta0_np, task.lower, task.upper)
     xn_0 = task.simulator(theta0_np, n_samples=task.n_obs) 
     xn_0_tensor = torch.from_numpy(xn_0).float().to(device)
     
@@ -119,6 +127,7 @@ def approximate_likelihood_core(theta, x_obs_stats, task, stats_fn, epsilon, dev
     """
     # 1. Simulate (Numpy) - forced by task.simulator
     # theta: (batch, d)
+    theta = np.clip(theta, task.lower, task.upper)
     sim_data = task.simulator(theta, n_samples=task.n_obs)
     
     # 2. To Tensor
@@ -367,19 +376,25 @@ def compute_metrics(samples, theta_true):
     # 1. Bias (Mean - True)
     # L2 distance between mean and true parameters.
     
-    mean_est = np.mean(samples, axis=0)
-    bias_vec = mean_est - theta_true
+    samples = np.asarray(samples, dtype=np.float64)
+    theta_true = np.asarray(theta_true, dtype=np.float64)
+
+    samples_exp = np.exp(samples)
+    theta_true_exp = np.exp(theta_true)
+
+    mean_est = np.mean(samples_exp, axis=0)
+    bias_vec = mean_est - theta_true_exp
     bias_l2 = np.linalg.norm(bias_vec) # Scalar L2 distance
     
     # 2. 95% HDI (Credible Interval)
     # Using quantiles [0.025, 0.975]
-    lower = np.quantile(samples, 0.025, axis=0)
-    upper = np.quantile(samples, 0.975, axis=0)
+    lower = np.quantile(samples_exp, 0.025, axis=0)
+    upper = np.quantile(samples_exp, 0.975, axis=0)
     length = upper - lower
     
     # 3. Coverage
     # Check if theta_true is within [lower, upper]
-    covered = (theta_true >= lower) & (theta_true <= upper)
+    covered = (theta_true_exp >= lower) & (theta_true_exp <= upper)
     
     return {
         "bias_l2": bias_l2,

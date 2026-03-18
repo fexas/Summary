@@ -139,6 +139,9 @@ class LVTask:
         Returns:
             observations: (batch_size, n_obs, 2)
         """
+        theta = np.asarray(theta, dtype=np.float32)
+        theta = np.atleast_2d(theta)
+        theta = np.clip(theta, self.lower, self.upper)
         batch_size = theta.shape[0]
         
         # Convert log-params to rates

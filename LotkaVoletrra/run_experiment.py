@@ -65,6 +65,42 @@ except FileNotFoundError:
         "n_observation": 151
     }
 
+if os.environ.get("LV_QUICK_TEST") == "1":
+    CONFIG = dict(CONFIG)
+    CONFIG["num_rounds"] = 1
+    CONFIG["dataset_size"] = min(int(CONFIG.get("dataset_size", 20000)), 512)
+    CONFIG["val_size"] = min(int(CONFIG.get("val_size", 1000)), 50)
+    CONFIG["n_samples_posterior"] = min(int(CONFIG.get("n_samples_posterior", 1000)), 50)
+
+    smmd_mmd_cfg = dict(CONFIG.get("smmd_mmd_config", {}))
+    smmd_mmd_cfg["initial_train_samples"] = min(int(smmd_mmd_cfg.get("initial_train_samples", 512)), 512)
+    smmd_mmd_cfg["refine_train_samples"] = min(int(smmd_mmd_cfg.get("refine_train_samples", 512)), 512)
+    smmd_mmd_cfg["bandwidth_n_samples"] = min(int(smmd_mmd_cfg.get("bandwidth_n_samples", 4400)), 1000)
+    CONFIG["smmd_mmd_config"] = smmd_mmd_cfg
+
+    models_cfg = dict(CONFIG.get("models_config", {}))
+    for k in ["smmd", "mmd", "bayesflow"]:
+        sub = dict(models_cfg.get(k, {}))
+        sub["epochs"] = min(int(sub.get("epochs", 30)), 20)
+        sub["num_refine_rounds"] = 1
+        sub["refined_mode"] = 1
+        sub["refine_dataset_size"] = min(int(sub.get("refine_dataset_size", 512)), 512)
+        if k == "bayesflow":
+            sub["run_mcmc"] = False
+        sub.setdefault("mcmc_burn_in", 5)
+        models_cfg[k] = sub
+    dnn = dict(models_cfg.get("dnnabc", {}))
+    dnn["epochs"] = min(int(dnn.get("epochs", 30)), 20)
+    dnn["train_samples"] = min(int(dnn.get("train_samples", 512)), 512)
+    dnn["n_pool"] = min(int(dnn.get("n_pool", 6000)), 2000)
+    models_cfg["dnnabc"] = dnn
+    npe = dict(models_cfg.get("npe", {}))
+    npe["sbi_rounds"] = min(int(npe.get("sbi_rounds", 2)), 2)
+    npe["sims_per_round"] = min(int(npe.get("sims_per_round", 1000)), 1000)
+    npe["epochs"] = min(int(npe.get("epochs", 50)), 50)
+    models_cfg["npe"] = npe
+    CONFIG["models_config"] = models_cfg
+
 # Hyperparameters from Config
 DATASET_SIZE = CONFIG.get("dataset_size", 20000)
 VAL_SIZE = CONFIG.get("val_size", 1000)
@@ -294,36 +330,112 @@ def plot_combined_posteriors(all_model_samples, theta_true, output_dir, filename
     if not all_model_samples:
         return
 
-    num_params = next(iter(all_model_samples.values())).shape[1]
-    cols = num_params
-    
-    fig, axes = plt.subplots(1, cols, figsize=(6 * cols, 6))
-    if cols == 1: axes = [axes]
-    
-    # Define colors or styles if needed, but seaborn handles hue well if we dataframe it
-    
-    for i in range(cols):
+    sns.set_theme(style="whitegrid", font_scale=1.5)
+
+    dims_to_plot = list(range(min(4, next(iter(all_model_samples.values())).shape[1])))
+    param_names = [rf"$\log(\theta_{{{i+1}}})$" for i in dims_to_plot]
+
+    colors = {
+        "SMMD": "#DB1218",
+        "MMD": "#1083CA",
+        "BAYESFLOW": "#49C926",
+        "DNNABC": "#8315dd",
+        "NPE": "#f19327",
+        "TRUE": "#FA0101",
+    }
+
+    cols = len(dims_to_plot)
+    fig, axes = plt.subplots(1, cols, figsize=(24, 6))
+    plt.subplots_adjust(left=0.05, right=0.95, top=0.85, bottom=0.20, wspace=0.25)
+    if cols == 1:
+        axes = [axes]
+
+    tick_labelsize = 22
+    title_fontsize = 28
+    legend_fontsize = 22
+    label_fontsize = 24
+
+    for i, dim_idx in enumerate(dims_to_plot):
         ax = axes[i]
-        param_name = f'theta{i+1}'
-        param_symbol = rf'$\theta_{{{i+1}}}$'
-        
+
         for model_name, samples in all_model_samples.items():
-            label_name = model_name
-            if model_name.endswith("_refineplus"):
-                base = model_name[:-11]
-                label_name = f"{base.upper()}+Refine+"
-            else:
-                label_name = model_name.upper()
-            sns.kdeplot(x=samples[:, i], label=label_name, ax=ax, alpha=0.3, fill=False, linewidth=2)
-            
-        if i < len(theta_true):
-            ax.axvline(x=theta_true[i], color='black', linestyle='--', linewidth=2, label='True')
-            
-        ax.set_title(f'Marginal {param_symbol}')
-        ax.legend()
-        
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, filename))
+            if samples is None:
+                continue
+            if isinstance(samples, torch.Tensor):
+                samples = samples.detach().cpu().numpy()
+
+            label_upper = str(model_name).upper()
+            c = "#333333"
+            if "SMMD" in label_upper:
+                c = colors["SMMD"]
+            elif "MMD" in label_upper:
+                c = colors["MMD"]
+            elif "BAYESFLOW" in label_upper:
+                c = colors["BAYESFLOW"]
+            elif "DNN" in label_upper:
+                c = colors["DNNABC"]
+            elif "NPE" in label_upper or "SNPE" in label_upper:
+                c = colors["NPE"]
+
+            sns.kdeplot(
+                x=samples[:, dim_idx],
+                label=label_upper,
+                ax=ax,
+                color=c,
+                fill=True,
+                alpha=0.15,
+                linewidth=4.5,
+            )
+
+        if dim_idx < len(theta_true):
+            ax.axvline(
+                x=theta_true[dim_idx],
+                color=colors["TRUE"],
+                linestyle="-",
+                linewidth=4.0,
+                label="True Value",
+                alpha=0.95,
+            )
+
+        ax.set_title(param_names[i], fontsize=title_fontsize, fontweight="bold", pad=15)
+        ax.tick_params(axis="both", which="major", labelsize=tick_labelsize, width=2, length=6)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("black")
+            spine.set_linewidth(1.5)
+        if i == 0:
+            ax.set_ylabel("Density", fontsize=label_fontsize, fontweight="bold")
+        else:
+            ax.set_ylabel("")
+        ax.grid(True, linestyle="--", alpha=0.4, linewidth=1.0)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    order = ["SMMD", "MMD", "BAYESFLOW", "DNNABC", "NPE", "True Value"]
+    handles_sorted = []
+    labels_sorted = []
+    for l in order:
+        for k in by_label.keys():
+            if l == "True Value" and k == "True Value":
+                handles_sorted.append(by_label[k])
+                labels_sorted.append(k)
+            elif l in k and k not in labels_sorted and "True Value" not in k:
+                handles_sorted.append(by_label[k])
+                labels_sorted.append(k)
+    if not handles_sorted:
+        handles_sorted = handles
+        labels_sorted = labels
+    fig.legend(
+        handles_sorted,
+        labels_sorted,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.08),
+        ncol=min(len(handles_sorted), 5),
+        fontsize=legend_fontsize,
+        frameon=False,
+        columnspacing=1.5,
+    )
+
+    plt.savefig(os.path.join(output_dir, filename), dpi=350, bbox_inches="tight")
     plt.close()
 
 def plot_refinement_comparison(samples_dict, theta_true, output_dir, model_name):
@@ -333,30 +445,248 @@ def plot_refinement_comparison(samples_dict, theta_true, output_dir, model_name)
     """
     os.makedirs(output_dir, exist_ok=True)
     filename = f"{model_name}_refinement_comparison.png"
-    
-    num_params = next(iter(samples_dict.values())).shape[1]
-    cols = num_params
-    
-    fig, axes = plt.subplots(1, cols, figsize=(5 * cols, 5))
-    if cols == 1: axes = [axes]
-    
-    for i in range(cols):
+
+    valid_samples = [s for s in samples_dict.values() if s is not None]
+    if not valid_samples:
+        return
+
+    sns.set_theme(style="whitegrid", font_scale=1.5)
+
+    d_local = valid_samples[0].shape[1]
+    dims_to_plot = list(range(min(4, d_local)))
+    param_names = [rf"$\log(\theta_{{{i+1}}})$" for i in dims_to_plot]
+
+    colors = {
+        "SMMD (Refined)": "#FF3A20",
+        "SMMD (Baseline)": "#DB1218",
+        "MMD (Refined)": "#3FA7D6",
+        "MMD (Baseline)": "#1083CA",
+        "BAYESFLOW (Refined)": "#49C926",
+        "BAYESFLOW (Baseline)": "#2E7D32",
+        "TRUE": "#FA0101",
+    }
+
+    cols = len(dims_to_plot)
+    fig, axes = plt.subplots(1, cols, figsize=(24, 6))
+    plt.subplots_adjust(left=0.05, right=0.95, top=0.85, bottom=0.20, wspace=0.25)
+    if cols == 1:
+        axes = [axes]
+
+    tick_labelsize = 22
+    title_fontsize = 28
+    legend_fontsize = 22
+    label_fontsize = 24
+
+    model_upper = str(model_name).upper()
+    for i, dim_idx in enumerate(dims_to_plot):
         ax = axes[i]
-        param_name = f'theta{i+1}'
-        param_symbol = rf'$\theta_{{{i+1}}}$'
-        
+
         for label, samples in samples_dict.items():
-            if samples is not None:
-                sns.kdeplot(x=samples[:, i], label=label, ax=ax, alpha=0.3, fill=True)
-            
-        if i < len(theta_true):
-            ax.axvline(x=theta_true[i], color='black', linestyle='--', linewidth=2, label='True')
-            
-        ax.set_title(f'{model_name.upper()} - {param_symbol}')
-        ax.legend()
-        
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, filename))
+            if samples is None:
+                continue
+            if isinstance(samples, torch.Tensor):
+                samples = samples.detach().cpu().numpy()
+
+            is_amortized = label.lower().startswith("initial") or label.lower().startswith("amort")
+            if "SMMD" in model_upper:
+                c = colors["SMMD (Baseline)" if is_amortized else "SMMD (Refined)"]
+            elif "MMD" in model_upper:
+                c = colors["MMD (Baseline)" if is_amortized else "MMD (Refined)"]
+            else:
+                c = colors["BAYESFLOW (Baseline)" if is_amortized else "BAYESFLOW (Refined)"]
+
+            if is_amortized:
+                sns.kdeplot(
+                    x=samples[:, dim_idx],
+                    label=f"{model_upper} (Amortized)",
+                    ax=ax,
+                    color=c,
+                    fill=False,
+                    linestyle="--",
+                    linewidth=3.5,
+                )
+            else:
+                sns.kdeplot(
+                    x=samples[:, dim_idx],
+                    label=f"{model_upper} (Refined)",
+                    ax=ax,
+                    color=c,
+                    fill=True,
+                    alpha=0.15,
+                    linewidth=4.5,
+                )
+
+        if dim_idx < len(theta_true):
+            ax.axvline(
+                x=theta_true[dim_idx],
+                color=colors["TRUE"],
+                linestyle="-",
+                linewidth=4.0,
+                label="True Value",
+                alpha=0.95,
+            )
+
+        ax.set_title(param_names[i], fontsize=title_fontsize, fontweight="bold", pad=15)
+        ax.tick_params(axis="both", which="major", labelsize=tick_labelsize, width=2, length=6)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("black")
+            spine.set_linewidth(1.5)
+        if i == 0:
+            ax.set_ylabel("Density", fontsize=label_fontsize, fontweight="bold")
+        else:
+            ax.set_ylabel("")
+        ax.grid(True, linestyle="--", alpha=0.4, linewidth=1.0)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    possible = [f"{model_upper} (Refined)", f"{model_upper} (Amortized)", "True Value"]
+    sorted_handles = []
+    sorted_labels = []
+    for k in possible:
+        if k in by_label:
+            sorted_handles.append(by_label[k])
+            sorted_labels.append(k)
+    fig.legend(
+        sorted_handles,
+        sorted_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.08),
+        ncol=min(len(sorted_handles), 4),
+        fontsize=legend_fontsize,
+        frameon=False,
+        columnspacing=1.5,
+    )
+    plt.savefig(os.path.join(output_dir, filename), dpi=350, bbox_inches="tight")
+    plt.close()
+
+def plot_all_refinement_comparisons(all_results_dict, theta_true, output_dir, filename="all_models_refinement_comparison.png"):
+    os.makedirs(output_dir, exist_ok=True)
+    if not all_results_dict:
+        return
+
+    sns.set_theme(style="whitegrid", font_scale=1.5)
+
+    d_local = next(iter(all_results_dict.values()))["Amortized"].shape[1]
+    dims_to_plot = list(range(min(4, d_local)))
+    param_names = [rf"$\log(\theta_{{{i+1}}})$" for i in dims_to_plot]
+
+    colors = {
+        "SMMD (Refined)": "#FF3A20",
+        "SMMD (Baseline)": "#DB1218",
+        "MMD (Refined)": "#3FA7D6",
+        "MMD (Baseline)": "#1083CA",
+        "BAYESFLOW (Refined)": "#49C926",
+        "BAYESFLOW (Baseline)": "#2E7D32",
+        "TRUE": "#FA0101",
+    }
+
+    cols = len(dims_to_plot)
+    fig, axes = plt.subplots(1, cols, figsize=(24, 6))
+    plt.subplots_adjust(left=0.05, right=0.95, top=0.85, bottom=0.20, wspace=0.25)
+    if cols == 1:
+        axes = [axes]
+
+    tick_labelsize = 22
+    title_fontsize = 28
+    legend_fontsize = 22
+    label_fontsize = 24
+
+    for i, dim_idx in enumerate(dims_to_plot):
+        ax = axes[i]
+        for model_name, result_dict in all_results_dict.items():
+            if result_dict is None:
+                continue
+            amortized = result_dict.get("Amortized")
+            refined = result_dict.get("Refined")
+            if amortized is None or refined is None:
+                continue
+
+            if isinstance(amortized, torch.Tensor):
+                amortized = amortized.detach().cpu().numpy()
+            if isinstance(refined, torch.Tensor):
+                refined = refined.detach().cpu().numpy()
+
+            model_upper = str(model_name).upper()
+            if model_name.lower() == "smmd":
+                c_base = colors["SMMD (Baseline)"]
+                c_ref = colors["SMMD (Refined)"]
+                label = "SMMD"
+            elif model_name.lower() == "mmd":
+                c_base = colors["MMD (Baseline)"]
+                c_ref = colors["MMD (Refined)"]
+                label = "MMD"
+            elif model_name.lower() == "bayesflow":
+                c_base = colors["BAYESFLOW (Baseline)"]
+                c_ref = colors["BAYESFLOW (Refined)"]
+                label = "BAYESFLOW"
+            else:
+                continue
+
+            sns.kdeplot(
+                x=amortized[:, dim_idx],
+                label=f"{label} (Amortized)",
+                ax=ax,
+                color=c_base,
+                fill=False,
+                linestyle="--",
+                linewidth=3.5,
+            )
+            sns.kdeplot(
+                x=refined[:, dim_idx],
+                label=f"{label} (Refined)",
+                ax=ax,
+                color=c_ref,
+                fill=True,
+                alpha=0.15,
+                linewidth=4.5,
+            )
+
+        if dim_idx < len(theta_true):
+            ax.axvline(
+                x=theta_true[dim_idx],
+                color=colors["TRUE"],
+                linestyle="-",
+                linewidth=4.0,
+                label="True Value",
+                alpha=0.95,
+            )
+
+        ax.set_title(param_names[i], fontsize=title_fontsize, fontweight="bold", pad=15)
+        ax.tick_params(axis="both", which="major", labelsize=tick_labelsize, width=2, length=6)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("black")
+            spine.set_linewidth(1.5)
+        if i == 0:
+            ax.set_ylabel("Density", fontsize=label_fontsize, fontweight="bold")
+        else:
+            ax.set_ylabel("")
+        ax.grid(True, linestyle="--", alpha=0.4, linewidth=1.0)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    order = [
+        "SMMD (Refined)", "SMMD (Amortized)",
+        "MMD (Refined)", "MMD (Amortized)",
+        "BAYESFLOW (Refined)", "BAYESFLOW (Amortized)",
+        "True Value",
+    ]
+    sorted_handles = []
+    sorted_labels = []
+    for l in order:
+        if l in by_label:
+            sorted_handles.append(by_label[l])
+            sorted_labels.append(l)
+    fig.legend(
+        sorted_handles,
+        sorted_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.08),
+        ncol=min(len(sorted_handles), 4),
+        fontsize=legend_fontsize,
+        frameon=False,
+        columnspacing=1.5,
+    )
+    plt.savefig(os.path.join(output_dir, filename), dpi=350, bbox_inches="tight")
     plt.close()
 
 # ============================================================================
@@ -419,10 +749,15 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
         num_rounds = model_config.get("sbi_rounds", 1)
         sims_per_round = model_config.get("sims_per_round", 1000)
         max_epochs = model_config.get("epochs", 1000)
+        sample_with = None
+        if os.environ.get("LV_QUICK_TEST") == "1":
+            sample_with = "mcmc"
         posterior_samples = run_sbi_model(
             model_type, train_loader, x_obs, theta_true, task,
             device=DEVICE, num_rounds=num_rounds,
             sims_per_round=sims_per_round, max_epochs=max_epochs,
+            n_posterior_samples=n_samples,
+            sample_with=sample_with,
             initial_training_data=initial_training_data
         )
     elif model_type == "dnnabc":
@@ -463,6 +798,8 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
             }
     elif hasattr(model, "sample_posterior"):
         posterior_samples = model.sample_posterior(x_obs, n_samples)
+        if isinstance(posterior_samples, torch.Tensor):
+            posterior_samples = posterior_samples.detach().cpu().numpy()
     else:
         print("Model cannot sample.")
         return None
@@ -731,7 +1068,7 @@ def run_single_experiment(model_type, task, train_loader, theta_true, x_obs, rou
     # ========================================================================
     # 6. ABC-MCMC Refinement (For SMMD/MMD/BayesFlow)
     # ========================================================================
-    run_mcmc = model_type in ["smmd", "mmd", "bayesflow"]
+    run_mcmc = (model_type in ["smmd", "mmd", "bayesflow"]) and bool(model_config.get("run_mcmc", True))
     
     if run_mcmc:
         # Check Refined Mode for MCMC
@@ -849,7 +1186,7 @@ def main():
         theta_true, x_obs = task.get_ground_truth()
         
         round_initial_samples = {}
-        round_refineplus_samples = {}
+        round_refinement_data = {}
         
         # Run Models
         for model_name in MODELS:
@@ -877,7 +1214,10 @@ def main():
                     samples = res["samples"]
                     
                     if "initial" in samples:
-                        round_initial_samples[model_name] = samples["initial"]
+                        init_s = samples["initial"]
+                        if isinstance(init_s, torch.Tensor):
+                            init_s = init_s.detach().cpu().numpy()
+                        round_initial_samples[model_name] = init_s
                     
                     if model_name in ["smmd", "mmd", "bayesflow"]:
                         final_refined = None
@@ -887,7 +1227,12 @@ def main():
                                 final_refined = value
                                 break
                         if final_refined is not None:
-                            round_refineplus_samples[f"{model_name}_refineplus"] = final_refined
+                            if isinstance(final_refined, torch.Tensor):
+                                final_refined = final_refined.detach().cpu().numpy()
+                            round_refinement_data[model_name] = {
+                                "Amortized": round_initial_samples.get(model_name),
+                                "Refined": final_refined,
+                            }
                             
                             plot_samples = {
                                 "Initial": samples.get("initial"),
@@ -954,12 +1299,20 @@ def main():
 
         if round_initial_samples:
             print("Generating combined posterior plot...")
-            plot_combined_posteriors(round_initial_samples, theta_true, f"results/comparisons/round_{round_idx}", "all_methods_initial_posterior.png")
+            plot_combined_posteriors(
+                round_initial_samples,
+                theta_true,
+                f"results/comparisons/round_{round_idx}",
+                "all_methods_initial_posterior.png",
+            )
         
-        if round_refineplus_samples:
-            combined_samples = dict(round_initial_samples)
-            combined_samples.update(round_refineplus_samples)
-            plot_combined_posteriors(combined_samples, theta_true, f"results/comparisons/round_{round_idx}", "all_methods_with_refineplus_posterior.png")
+        if round_refinement_data:
+            plot_all_refinement_comparisons(
+                round_refinement_data,
+                theta_true,
+                f"results/comparisons/round_{round_idx}",
+                filename="all_models_refinement_comparison.png",
+            )
 
         aggregate_and_save_results(model_results_table)
 

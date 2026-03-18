@@ -1,5 +1,5 @@
 {
-    "num_rounds": 3,
+    "num_rounds": 100,
     "N": 1e6,
     "T_MAX": 160.0,
     "NUM_OBS": 80,

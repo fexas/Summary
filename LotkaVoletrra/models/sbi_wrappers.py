@@ -88,7 +88,7 @@ def calculate_summary_statistics(x):
     return summary_stats
 
 def run_sbi_model(model_type, train_loader, x_obs, theta_true, task, device="cpu",
-                  num_rounds=1, sims_per_round=1000, max_epochs=1000, **kwargs):
+                  num_rounds=1, sims_per_round=1000, max_epochs=1000, n_posterior_samples=1000, sample_with=None, **kwargs):
     """
     Run SBI training and inference using SNPE-A logic.
     
@@ -181,14 +181,16 @@ def run_sbi_model(model_type, train_loader, x_obs, theta_true, task, device="cpu
             density_estimator = inference.train(**train_kwargs)
             
         # C. Build Posterior & Update Proposal
-        posterior = inference.build_posterior(density_estimator).set_default_x(x_obs_stats)
+        if sample_with is None:
+            posterior = inference.build_posterior(density_estimator).set_default_x(x_obs_stats)
+        else:
+            posterior = inference.build_posterior(density_estimator, sample_with=sample_with).set_default_x(x_obs_stats)
         proposal = posterior
 
         
     # 4. Final Sampling
     print("Sampling from final posterior...")
     
-    n_samples = 1000 # Final posterior samples count
-    samples = posterior.sample((n_samples,))
+    samples = posterior.sample((int(n_posterior_samples),))
     
     return samples.detach().cpu().numpy()

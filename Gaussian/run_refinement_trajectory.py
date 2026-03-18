@@ -13,6 +13,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap
 
@@ -37,7 +38,7 @@ BATCH_SIZE = 256
 DATASET_SIZE = 25600
 LEARNING_RATE = 1e-3
 L1_LAMBDA = 1e-4
-NUM_ROUNDS = 1
+NUM_ROUNDS = 20
 n = 50
 RESULTS_BASE = "results_trajectory"
 
@@ -314,10 +315,21 @@ def plot_trajectory_and_mmd(snapshots, mmd_history, true_samples, output_dir, pa
         spine.set_edgecolor('black')
         spine.set_linewidth(1.5)
         
-    # Set Y-limit for MMD Plot
-    ax_right.set_ylim(bottom=0.03)
-    # If max is high, let it auto scale, or cap it if needed. 
-    # Just setting bottom is safer.
+    mmd_arr = np.asarray(mmd_vals, dtype=float)
+    mmd_arr = mmd_arr[np.isfinite(mmd_arr)]
+    if mmd_arr.size > 0:
+        y_min = float(np.min(mmd_arr))
+        y_max = float(np.max(mmd_arr))
+        if y_min == y_max:
+            pad = max(abs(y_min) * 0.1, 1e-3)
+        else:
+            pad = (y_max - y_min) * 0.08
+        y0 = y_min - pad
+        y1 = y_max + pad
+        locator = mticker.MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10], min_n_ticks=4)
+        ticks = locator.tick_values(y0, y1)
+        ax_right.set_ylim(float(ticks[0]), float(ticks[-1]))
+        ax_right.yaxis.set_major_locator(locator)
 
     # Save
     safe_name = param_name.replace("$", "").replace("\\", "").replace("{", "").replace("}", "")
@@ -336,6 +348,7 @@ def main():
     
     # Load Config (and override defaults)
     config = load_config()
+    num_rounds = int(config.get("num_rounds", NUM_ROUNDS))
     n_obs = config.get("n_observation", n)
     # Refinement config
     refine_cfg = config.get("refine_config", {})
@@ -350,7 +363,7 @@ def main():
     trajectory_steps = 150 
     record_interval = 5
     
-    print(f"=== Refinement Trajectory Experiment (n={n_obs}) ===")
+    print(f"=== Refinement Trajectory Experiment (n={n_obs}, rounds={num_rounds}) ===")
     
     # Check Device
     if torch.backends.mps.is_available():
@@ -361,98 +374,99 @@ def main():
         device = torch.device("cpu")
     print(f"Device: {device}")
 
-    # 1. Data Generation
-    task = GaussianTask(n=n_obs)
-    print(f"Generating training data...")
-    theta_train, x_train = generate_dataset(task, n_sims=DATASET_SIZE, n_obs=n_obs)
-    
-    dataset = TensorDataset(torch.from_numpy(x_train).float(), torch.from_numpy(theta_train).float())
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    
-    # Ground Truth
-    theta_true, x_obs = task.get_ground_truth()
-    print(f"True Params: {theta_true}")
-    
-    # 2. True Posterior (MCMC)
-    print("Sampling True Posterior (Reference)...")
-    # Prepare 2D obs for MCMC helper
-    X_comp = x_obs[:, 0]
-    Y_comp = x_obs[:, 1]
-    Z_comp = x_obs[:, 2]
-    denom = 1.0 - Z_comp
-    denom[np.abs(denom) < 1e-6] = 1e-6
-    x_2d = np.stack([X_comp / denom, Y_comp / denom], axis=-1)
-    
-    # Load MCMC config
-    true_post_cfg = config.get("true_posterior_config", {})
-    mcmc_draws = true_post_cfg.get("n_draws", 2000)
-    mcmc_tune = true_post_cfg.get("n_tune_chain", 1000)
-    mcmc_chains = true_post_cfg.get("chains", 30)
-    base_scale = true_post_cfg.get("proposal_scale", 0.06)
-    
-    # Scale factor logic from run_experiment.py
-    scale_factor = float(25.0 / n_obs) ** 0.5
-    proposal_scale = base_scale * scale_factor
-    
-    print(f"MCMC Config: draws={mcmc_draws}, tune={mcmc_tune}, chains={mcmc_chains}, scale={proposal_scale}")
-    
-    true_posterior_samples = run_gaussian_posterior_mcmc(
-        x_2d, task, 
-        n_draws=mcmc_draws, 
-        n_tune_chain=mcmc_tune, 
-        chains=mcmc_chains,
-        proposal_scale=proposal_scale
-    )
-    
-    # 3. Train SMMD Model
-    print("Initializing and Training SMMD...")
-    smmd_model = SMMD_Model(summary_dim=10, d=d, d_x=d_x, n=n_obs)
-    
-    # Train
-    epochs_cfg = config.get("models_config", {}).get("smmd", 200)
-    if isinstance(epochs_cfg, dict):
-        epochs = epochs_cfg.get("epochs", 200)
-    else:
-        epochs = int(epochs_cfg)
-        
-    train_smmd(smmd_model, train_loader, epochs=epochs, device=device)
-    
-    # 4. Run Refinement with Trajectory
-    snapshots, mmd_history = refine_with_trajectory_tracking(
-        smmd_model, x_obs, task, true_posterior_samples,
-        n_chains=n_chains, 
-        n_samples=trajectory_steps, # Total steps
-        burn_in=0, # We track everything from start
-        nsims=nsims,
-        proposal_std=0.5,
-        device=str(device),
-        record_interval=record_interval
-    )
-    
-    # 5. Visualize
-    print("Generating Visualizations...")
-    
-    # Define params to plot (Indices: 0, 1, 2, 4 corresponding to theta_1, theta_2, theta_3, theta_5)
-    params_config = [
-        {"idx": 0, "name": r"$\theta_1$", "xlim": [0.5, 1.5]},
-        {"idx": 1, "name": r"$\theta_2$", "xlim": [0.5, 1.5]},
-        {"idx": 2, "name": r"$\theta_3$", "xlim": [-1.7, 1.7]},
-        {"idx": 4, "name": r"$\theta_5$", "xlim": [0.0, 1.2]},
-    ]
-    
-    for p_cfg in params_config:
-        plot_trajectory_and_mmd(
-            snapshots, 
-            mmd_history, 
-            true_posterior_samples, 
-            RESULTS_BASE, 
-            param_idx=p_cfg["idx"], 
-            param_name=p_cfg["name"],
-            x_lim=p_cfg["xlim"]
+    for round_idx in range(1, num_rounds + 1):
+        round_dir = os.path.join(RESULTS_BASE, f"round_{round_idx}")
+        os.makedirs(round_dir, exist_ok=True)
+        print(f"\n--- Round {round_idx}/{num_rounds} ---")
+
+        task = GaussianTask(n=n_obs)
+        print("Generating training data...")
+        theta_train, x_train = generate_dataset(task, n_sims=DATASET_SIZE, n_obs=n_obs)
+        dataset = TensorDataset(
+            torch.from_numpy(x_train).float(), torch.from_numpy(theta_train).float()
         )
-    
-    # Save Data
-    np.save(os.path.join(RESULTS_BASE, "mmd_history.npy"), np.array(mmd_history))
+        train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+        theta_true, x_obs = task.get_ground_truth()
+        print(f"True Params: {theta_true}")
+
+        print("Sampling True Posterior (Reference)...")
+        X_comp = x_obs[:, 0]
+        Y_comp = x_obs[:, 1]
+        Z_comp = x_obs[:, 2]
+        denom = 1.0 - Z_comp
+        denom[np.abs(denom) < 1e-6] = 1e-6
+        x_2d = np.stack([X_comp / denom, Y_comp / denom], axis=-1)
+
+        true_post_cfg = config.get("true_posterior_config", {})
+        mcmc_draws = true_post_cfg.get("n_draws", 2000)
+        mcmc_tune = true_post_cfg.get("n_tune_chain", 1000)
+        mcmc_chains = true_post_cfg.get("chains", 30)
+        base_scale = true_post_cfg.get("proposal_scale", 0.06)
+
+        scale_factor = float(25.0 / n_obs) ** 0.5
+        proposal_scale = base_scale * scale_factor
+
+        print(
+            f"MCMC Config: draws={mcmc_draws}, tune={mcmc_tune}, "
+            f"chains={mcmc_chains}, scale={proposal_scale}"
+        )
+
+        true_posterior_samples = run_gaussian_posterior_mcmc(
+            x_2d,
+            task,
+            n_draws=mcmc_draws,
+            n_tune_chain=mcmc_tune,
+            chains=mcmc_chains,
+            proposal_scale=proposal_scale,
+        )
+
+        print("Initializing and Training SMMD...")
+        smmd_model = SMMD_Model(summary_dim=10, d=d, d_x=d_x, n=n_obs)
+
+        epochs_cfg = config.get("models_config", {}).get("smmd", 200)
+        if isinstance(epochs_cfg, dict):
+            epochs = epochs_cfg.get("epochs", 200)
+        else:
+            epochs = int(epochs_cfg)
+
+        train_smmd(smmd_model, train_loader, epochs=epochs, device=device)
+
+        snapshots, mmd_history = refine_with_trajectory_tracking(
+            smmd_model,
+            x_obs,
+            task,
+            true_posterior_samples,
+            n_chains=n_chains,
+            n_samples=trajectory_steps,
+            burn_in=0,
+            nsims=nsims,
+            proposal_std=0.5,
+            device=str(device),
+            record_interval=record_interval,
+        )
+
+        print("Generating Visualizations...")
+        params_config = [
+            {"idx": 0, "name": r"$\theta_1$", "xlim": [0.5, 1.5]},
+            {"idx": 1, "name": r"$\theta_2$", "xlim": [0.5, 1.5]},
+            {"idx": 2, "name": r"$\theta_3$", "xlim": [-1.7, 1.7]},
+            {"idx": 4, "name": r"$\theta_5$", "xlim": [0.0, 1.2]},
+        ]
+
+        for p_cfg in params_config:
+            plot_trajectory_and_mmd(
+                snapshots,
+                mmd_history,
+                true_posterior_samples,
+                round_dir,
+                param_idx=p_cfg["idx"],
+                param_name=p_cfg["name"],
+                x_lim=p_cfg["xlim"],
+            )
+
+        np.save(os.path.join(round_dir, "mmd_history.npy"), np.array(mmd_history))
+
     print("Experiment Complete.")
 
 if __name__ == "__main__":
