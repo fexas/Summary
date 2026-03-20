@@ -305,7 +305,7 @@ def plot_trajectory_and_mmd(snapshots, mmd_history, true_samples, output_dir, pa
     
     ax_right.set_xlabel("Iteration", fontweight='bold')
     ax_right.set_ylabel("MMD (Median Heuristic)", fontweight='bold')
-    ax_right.set_title("Optimization Metric Convergence", pad=15)
+    ax_right.set_title("MMD over iteration", pad=15)
     
     # Grid
     ax_right.grid(True, linestyle='--', alpha=0.5)

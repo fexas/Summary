@@ -369,8 +369,13 @@ def compute_mmd_metric(samples_approx, samples_true):
     # 1. Compute Bandwidth h from True Samples (Y)
     # Pairwise squared Euclidean distances for Y
     # ||y_i - y_j||^2 = ||y_i||^2 + ||y_j||^2 - 2 <y_i, y_j>
-    Y_sq = np.sum(Y**2, axis=1, keepdims=True)
-    D_YY_sq = Y_sq + Y_sq.T - 2 * np.dot(Y, Y.T)
+    Y_for_bw = np.asarray(Y, dtype=float)
+    if Y_for_bw.ndim == 2 and Y_for_bw.shape[1] >= 4:
+        Y_for_bw = Y_for_bw.copy()
+        Y_for_bw[:, 2] = np.abs(Y_for_bw[:, 2])
+        Y_for_bw[:, 3] = np.abs(Y_for_bw[:, 3])
+    Y_sq = np.sum(Y_for_bw**2, axis=1, keepdims=True)
+    D_YY_sq = Y_sq + Y_sq.T - 2 * np.dot(Y_for_bw, Y_for_bw.T)
     # Numerical stability
     D_YY_sq = np.maximum(D_YY_sq, 0)
     D_YY = np.sqrt(D_YY_sq)

@@ -142,16 +142,20 @@ class TimeSeriesSummary(keras.Model):
     def __init__(self, input_dim, output_dim=10, hidden_dim=64, **kwargs):
         super().__init__(**kwargs)
         init = keras.initializers.RandomNormal(mean=0.0, stddev=0.2)
-        self.conv1 = keras.layers.Conv1D(filters=hidden_dim, kernel_size=10, padding="same", activation="relu", kernel_initializer=init)
+        self.pad1 = keras.layers.ZeroPadding1D(padding=2)
+        self.conv1 = keras.layers.Conv1D(filters=hidden_dim, kernel_size=10, padding="valid", activation="relu", kernel_initializer=init)
         self.pool1 = keras.layers.MaxPooling1D(pool_size=2)
-        self.conv2 = keras.layers.Conv1D(filters=hidden_dim*2, kernel_size=10, padding="same", activation="relu", kernel_initializer=init)
+        self.pad2 = keras.layers.ZeroPadding1D(padding=2)
+        self.conv2 = keras.layers.Conv1D(filters=hidden_dim*2, kernel_size=10, padding="valid", activation="relu", kernel_initializer=init)
         self.global_pool = keras.layers.GlobalAveragePooling1D()
         self.norm = RMSNorm()
         self.dense = keras.layers.Dense(output_dim, kernel_initializer=init)
         
     def call(self, x):
+        x = self.pad1(x)
         x = self.conv1(x)
         x = self.pool1(x)
+        x = self.pad2(x)
         x = self.conv2(x)
         x = self.global_pool(x)
         x = self.norm(x)

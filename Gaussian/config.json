@@ -45,7 +45,7 @@
         },
         "dnnabc": {
             "epochs": 200,
-            "n_pool": 50000,
+            "n_pool": 200000,
             "abc_batch_size": 10000
         },
         "npe": {

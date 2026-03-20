@@ -308,7 +308,7 @@ def refine_posterior_bayesflow(model, x_obs, task,
                               task.log_prior, likelihood_fn,
                               n_chains, n_samples, burn_in, thin, proposal_std)
 
-def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_level=0.005, device="cpu"):
+def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_level=0.01, device="cpu"):
     print(f"Computing bandwidth for BayesFlow refinement...")
     
     # Generate simulations from Prior
