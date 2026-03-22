@@ -1,16 +1,16 @@
 {
     "n_observation": 50,
     "n_observation_list": [25,50,100],
-    "dataset_size": 19200,
-    "batch_size": 128,
+    "dataset_size": 12800,
+    "batch_size": 256,
     "learning_rate": 0.001,
     "n_samples_posterior": 2000,
     "num_rounds": 10,
     "true_posterior_config": {
         "method": "mcmc",
         "n_draws": 1,
-        "n_tune_chain": 5000,
-        "chains": 2000,
+        "n_tune_chain": 7500,
+        "chains": 5000, 
         "proposal_scale": 0.12
     },
     "refine_config": {
@@ -29,22 +29,22 @@
     ],
     "models_config": {
         "smmd": {
-            "epochs": 200,
+            "epochs": 300,
             "summary_dim": 10,
             "learning_rate": 0.001
         },
         "mmd": {
-            "epochs": 200,
+            "epochs": 300,
             "summary_dim": 10,
             "learning_rate": 0.001
         },
         "bayesflow": {
-            "epochs": 100,
+            "epochs": 300,
             "summary_dim": 10,
             "learning_rate": 0.001
         },
         "dnnabc": {
-            "epochs": 200,
+            "epochs": 300,
             "n_pool": 200000,
             "abc_batch_size": 10000
         },

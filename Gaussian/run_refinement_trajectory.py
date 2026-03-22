@@ -147,7 +147,7 @@ def refine_with_trajectory_tracking(
     # Initial Probabilities
     current_log_prior = task.log_prior(current_theta)
     current_likelihood = likelihood_fn(current_theta, x_obs_stats)
-    current_log_prob = current_log_prior + np.log(current_likelihood + 1e-300)
+    current_log_prob = current_log_prior + np.log(current_likelihood + 1e-5)
 
     # Tracking Variables
     trajectory_snapshots = [] # List of (iteration, samples)
@@ -179,7 +179,7 @@ def refine_with_trajectory_tracking(
         # Calculate Probabilities
         proposed_log_prior = task.log_prior(proposed_theta)
         proposed_likelihood = likelihood_fn(proposed_theta, x_obs_stats)
-        proposed_log_prob = proposed_log_prior + np.log(proposed_likelihood + 1e-300)
+        proposed_log_prob = proposed_log_prior + np.log(proposed_likelihood + 1e-5)
         
         # Metropolis-Hastings Step
         log_alpha = proposed_log_prob - current_log_prob
@@ -360,7 +360,7 @@ def main():
     # But for trajectory visualization, we want to see the burn-in phase + mixing.
     # Let's run for a fixed number of iterations for visualization purposes, 
     # overriding the standard "just get one sample" logic.
-    trajectory_steps = 150 
+    trajectory_steps = 250 # 150 
     record_interval = 5
     
     print(f"=== Refinement Trajectory Experiment (n={n_obs}, rounds={num_rounds}) ===")
@@ -441,7 +441,7 @@ def main():
             n_samples=trajectory_steps,
             burn_in=0,
             nsims=nsims,
-            proposal_std=0.5,
+            proposal_std=0.2,
             device=str(device),
             record_interval=record_interval,
         )

@@ -8,11 +8,7 @@
     "learning_rate": 1e-3,
     "n_samples_posterior": 1000,
     "models_to_run": [
-        "smmd",
-        "mmd",
-        "bayesflow",
-        "dnnabc",
-        "npe"
+        "bayesflow"
     ],
     "models_config": {
         "smmd": {

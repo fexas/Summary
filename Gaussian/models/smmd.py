@@ -123,7 +123,7 @@ class Generator(nn.Module):
         layers = []
         in_dim = input_dim
         hidden_dim = 64
-        for _ in range(3):
+        for _ in range(4):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(RMSNorm(hidden_dim))
             layers.append(nn.ReLU())

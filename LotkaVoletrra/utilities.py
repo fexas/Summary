@@ -43,7 +43,7 @@ def run_mcmc_refinement(current_theta, x_obs_stats, task,
     if np.any(valid_mask_curr):
         theta_valid_curr = current_theta[valid_mask_curr]
         lik_valid_curr = likelihood_fn(theta_valid_curr, x_obs_stats)
-        log_lik_valid_curr = np.log(lik_valid_curr + 1e-300)
+        log_lik_valid_curr = np.log(lik_valid_curr + 1e-5)
         current_log_prob[valid_mask_curr] = current_log_prior[valid_mask_curr] + log_lik_valid_curr
     
     samples = []
@@ -280,26 +280,28 @@ def refine_posterior_bayesflow(model, x_obs, task,
     
     def stats_fn_torch(x_tensor):
         # x_tensor: (batch, n_obs, d_x)
-        x_np = x_tensor.cpu().numpy()
-        # model.summary_network expects (batch, n_obs, d_x)
-        # returns (batch, summary_dim)
-        stats = model.summary_network(x_np.astype(np.float32))
-        
-        if hasattr(stats, "cpu"): stats = stats.cpu()
-        if hasattr(stats, "numpy"): stats = stats.numpy()
-        
-        return torch.from_numpy(stats).float().to(device)
+        x_np = x_tensor.detach().cpu().numpy().astype(np.float32)
+        stats = model.summary_network(x_np)
+        if isinstance(stats, torch.Tensor):
+            stats_np = stats.detach().cpu().numpy()
+        elif hasattr(stats, "numpy"):
+            stats_np = stats.numpy()
+        else:
+            stats_np = np.asarray(stats)
+        return torch.from_numpy(np.asarray(stats_np, dtype=np.float32)).float().to(device)
 
     # Pre-compute x_obs_stats
     # model.summary_network might return a tensor or numpy
     # Ensure float32 for model input
     x_obs_cpu = x_obs_cpu.astype(np.float32)
     x_obs_stats_tf = model.summary_network(x_obs_cpu)
-    
-    if hasattr(x_obs_stats_tf, "cpu"): x_obs_stats_tf = x_obs_stats_tf.cpu()
-    if hasattr(x_obs_stats_tf, "numpy"): x_obs_stats_tf = x_obs_stats_tf.numpy()
-    
-    x_obs_stats = torch.from_numpy(x_obs_stats_tf).float().to(device)
+    if isinstance(x_obs_stats_tf, torch.Tensor):
+        x_obs_stats_np = x_obs_stats_tf.detach().cpu().numpy()
+    elif hasattr(x_obs_stats_tf, "numpy"):
+        x_obs_stats_np = x_obs_stats_tf.numpy()
+    else:
+        x_obs_stats_np = np.asarray(x_obs_stats_tf)
+    x_obs_stats = torch.from_numpy(np.asarray(x_obs_stats_np, dtype=np.float32)).float().to(device)
     
     def likelihood_fn(theta, target_stats):
         return approximate_likelihood_core(theta, target_stats, task, stats_fn_torch, epsilon, device)
@@ -310,35 +312,40 @@ def refine_posterior_bayesflow(model, x_obs, task,
 
 def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_level=0.01, device="cpu"):
     print(f"Computing bandwidth for BayesFlow refinement...")
-    
-    # Generate simulations from Prior
-    theta_prior = task.sample_prior(n_samples, "vague")
-    x_sim = task.simulator(theta_prior) # (n, n_obs, d_x)
-    
-    # Get stats
-    # Ensure x_sim is float32 (simulator might return int for population counts)
-    x_sim_float = x_sim.astype(np.float32)
-    stats_sim = model.summary_network(x_sim_float)
-    if hasattr(stats_sim, "cpu"): stats_sim = stats_sim.cpu()
-    if hasattr(stats_sim, "numpy"): stats_sim = stats_sim.numpy()
-    
-    # Get obs stats
+
     x_obs_cpu = x_obs if isinstance(x_obs, np.ndarray) else x_obs.cpu().numpy()
     if x_obs_cpu.ndim == 2: x_obs_cpu = x_obs_cpu[np.newaxis, ...]
-    
-    # Ensure float32
     x_obs_cpu = x_obs_cpu.astype(np.float32)
-    stats_obs = model.summary_network(x_obs_cpu)
-    if hasattr(stats_obs, "cpu"): stats_obs = stats_obs.cpu()
-    if hasattr(stats_obs, "numpy"): stats_obs = stats_obs.numpy()
-    
-    # Distances
-    diff = stats_sim - stats_obs
-    dist = np.linalg.norm(diff, axis=1)
-    
-    epsilon = np.quantile(dist, quantile_level)
-    print(f"Computed bandwidth (epsilon): {epsilon}")
-    return epsilon
+
+    x_obs_tensor = torch.from_numpy(x_obs_cpu).float().to(device)
+
+    def stats_fn_torch(x_tensor):
+        x_np = x_tensor.detach().cpu().numpy().astype(np.float32)
+        stats = model.summary_network(x_np)
+        if isinstance(stats, torch.Tensor):
+            stats_np = stats.detach().cpu().numpy()
+        elif hasattr(stats, "numpy"):
+            stats_np = stats.numpy()
+        else:
+            stats_np = np.asarray(stats)
+        return torch.from_numpy(np.asarray(stats_np, dtype=np.float32)).float().to(device)
+
+    theta0_np = None
+    try:
+        x_obs_rep = np.tile(x_obs_cpu, (n_samples, 1, 1))
+        post = model.sample(conditions={"summary_variables": x_obs_rep}, num_samples=1)
+        if isinstance(post, dict):
+            post = post["inference_variables"]
+        if hasattr(post, "numpy"):
+            post = post.numpy()
+        theta0_np = np.asarray(post).reshape(n_samples, -1)
+    except Exception as e:
+        print(f"Warning: Failed to sample BayesFlow posterior for bandwidth: {e}")
+
+    if theta0_np is None:
+        theta0_np = task.sample_prior(n_samples, "vague")
+
+    return compute_bandwidth_core(theta0_np, x_obs_tensor, task, stats_fn_torch, n_samples, quantile_level, device)
 
 # Backwards compatibility / Dispatcher
 def refine_posterior(model, *args, **kwargs):

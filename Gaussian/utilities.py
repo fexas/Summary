@@ -52,7 +52,7 @@ def run_mcmc_refinement(current_theta, x_obs_stats, task,
         # Proposed log prob
         proposed_log_prior = log_prior_fn(proposed_theta)
         proposed_likelihood = likelihood_fn(proposed_theta, x_obs_stats)
-        proposed_log_prob = proposed_log_prior + np.log(proposed_likelihood + 1e-300)
+        proposed_log_prob = proposed_log_prior + np.log(proposed_likelihood + 1e-5)
         
         # Metropolis-Hastings acceptance in log space
         log_alpha = proposed_log_prob - current_log_prob
@@ -203,7 +203,7 @@ def approximate_likelihood_core(theta, x_obs_stats, task, stats_fn, nsims, epsil
 # SMMD/MMD Implementation
 # =============================================================================
 
-def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.025, device="cpu"):
+def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.01, device="cpu"):
     print("Computing bandwidth for SMMD refinement...")
     x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
     x_obs_batch = x_obs_tensor.expand(n_samples, -1, -1)
@@ -218,7 +218,7 @@ def compute_bandwidth_smmd(model, x_obs, task, n_samples=5000, quantile_level=0.
 
 def refine_posterior_smmd(model, x_obs, task, 
                          n_chains=1000, n_samples=1, burn_in=99, 
-                         thin=1, nsims=50, epsilon=None, proposal_std=0.5, device="cpu"):
+                         thin=1, nsims=50, epsilon=None, proposal_std=0.2, device="cpu"):
     print(f"Starting SMMD MCMC Refinement...")
     
     if epsilon is None:
@@ -246,7 +246,7 @@ def refine_posterior_smmd(model, x_obs, task,
 # BayesFlow Implementation
 # =============================================================================
 
-def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_level=0.025, device="cpu"):
+def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_level=0.01, device="cpu"):
     print("Computing bandwidth for BayesFlow refinement...")
     x_obs_tensor = torch.from_numpy(x_obs[np.newaxis, ...]).float().to(device)
     
@@ -277,7 +277,7 @@ def compute_bandwidth_bayesflow(model, x_obs, task, n_samples=5000, quantile_lev
 
 def refine_posterior_bayesflow(model, x_obs, task, 
                               n_chains=1000, n_samples=1, burn_in=99, 
-                              thin=1, nsims=50, epsilon=None, proposal_std=0.5, device="cpu"):
+                              thin=1, nsims=50, epsilon=None, proposal_std=0.2, device="cpu"):
     print(f"Starting BayesFlow MCMC Refinement...")
     
     if epsilon is None:
@@ -350,71 +350,74 @@ def compute_mmd_metric(samples_approx, samples_true):
     if isinstance(samples_true, torch.Tensor):
         samples_true = samples_true.detach().cpu().numpy()
         
-    # Subsample if too large for pairwise computation (optional, but recommended for speed)
-    # If N > 2000, subsample to 2000 for metric calculation
-    n_max = 2000
-    if samples_approx.shape[0] > n_max:
-        idx = np.random.choice(samples_approx.shape[0], n_max, replace=False)
-        samples_approx = samples_approx[idx]
-    if samples_true.shape[0] > n_max:
-        idx = np.random.choice(samples_true.shape[0], n_max, replace=False)
-        samples_true = samples_true[idx]
-        
-    X = samples_approx
-    Y = samples_true
+    X = np.asarray(samples_approx, dtype=float)
+    Y = np.asarray(samples_true, dtype=float)
     
-    nx = X.shape[0]
     ny = Y.shape[0]
+    if X.ndim != 2 or Y.ndim != 2 or X.shape[1] != Y.shape[1]:
+        raise ValueError(f"Expected X and Y to be 2D with same parameter dimension, got X={X.shape}, Y={Y.shape}")
     
     # 1. Compute Bandwidth h from True Samples (Y)
-    # Pairwise squared Euclidean distances for Y
-    # ||y_i - y_j||^2 = ||y_i||^2 + ||y_j||^2 - 2 <y_i, y_j>
     Y_for_bw = np.asarray(Y, dtype=float)
     if Y_for_bw.ndim == 2 and Y_for_bw.shape[1] >= 4:
         Y_for_bw = Y_for_bw.copy()
         Y_for_bw[:, 2] = np.abs(Y_for_bw[:, 2])
         Y_for_bw[:, 3] = np.abs(Y_for_bw[:, 3])
-    Y_sq = np.sum(Y_for_bw**2, axis=1, keepdims=True)
-    D_YY_sq = Y_sq + Y_sq.T - 2 * np.dot(Y_for_bw, Y_for_bw.T)
-    # Numerical stability
-    D_YY_sq = np.maximum(D_YY_sq, 0)
-    D_YY = np.sqrt(D_YY_sq)
-    
-    # Extract upper triangle (excluding diagonal which is 0)
-    # np.triu_indices returns indices for upper triangle
-    # k=1 excludes diagonal
-    triu_idx = np.triu_indices(ny, k=1)
-    pairwise_dists = D_YY[triu_idx]
-    
-    h = np.median(pairwise_dists)
-    h_sq = h**2
-    
-    if h_sq < 1e-9:
-        h_sq = 1.0 # Fallback if degenerate
+
+    if ny < 2:
+        h_sq = 1.0
+    else:
+        max_pairs = 20000
+        num_pairs = min(max_pairs, ny * (ny - 1) // 2)
+        i = np.random.randint(0, ny, size=num_pairs)
+        j = np.random.randint(0, ny - 1, size=num_pairs)
+        j = j + (j >= i)
+        diffs = Y_for_bw[i] - Y_for_bw[j]
+        pairwise_dists = np.sqrt(np.sum(diffs * diffs, axis=1))
+        h = np.median(pairwise_dists)
+        h_sq = float(h * h)
+
+    if (not np.isfinite(h_sq)) or h_sq < 1e-12:
+        h_sq = 1.0
         
     # 2. Compute MMD^2
     # k(x, y) = exp(- ||x-y||^2 / h^2)
     
-    def rbf_kernel(A, B, h_sq):
-        A_sq = np.sum(A**2, axis=1, keepdims=True)
-        B_sq = np.sum(B**2, axis=1, keepdims=True)
-        D_AB_sq = A_sq + B_sq.T - 2 * np.dot(A, B.T)
-        D_AB_sq = np.maximum(D_AB_sq, 0)
-        return np.exp(-D_AB_sq / h_sq)
-    
-    K_XX = rbf_kernel(X, X, h_sq)
-    K_YY = rbf_kernel(Y, Y, h_sq)
-    K_XY = rbf_kernel(X, Y, h_sq)
+    def mean_rbf_kernel(A, B, h_sq, block_size=1024):
+        A = np.asarray(A, dtype=np.float32)
+        B = np.asarray(B, dtype=np.float32)
+        h_sq = np.float32(h_sq)
+
+        total = 0.0
+        count = 0
+        for i0 in range(0, A.shape[0], block_size):
+            i1 = min(i0 + block_size, A.shape[0])
+            A_blk = A[i0:i1]
+            A_sq = np.sum(A_blk * A_blk, axis=1, keepdims=True)
+            for j0 in range(0, B.shape[0], block_size):
+                j1 = min(j0 + block_size, B.shape[0])
+                B_blk = B[j0:j1]
+                B_sq = np.sum(B_blk * B_blk, axis=1, keepdims=True)
+                D = A_sq + B_sq.T - 2.0 * (A_blk @ B_blk.T)
+                np.maximum(D, 0.0, out=D)
+                total += float(np.exp(-D / h_sq).sum())
+                count += D.size
+        return total / max(count, 1)
+
+    mean_k_xx = mean_rbf_kernel(X, X, h_sq)
+    mean_k_yy = mean_rbf_kernel(Y, Y, h_sq)
+    mean_k_xy = mean_rbf_kernel(X, Y, h_sq)
     
     # Unbiased MMD^2 estimator usually excludes diagonal for XX and YY, 
     # but standard V-statistic includes them. 
     # Let's use the standard form: mean(K_XX) + mean(K_YY) - 2*mean(K_XY)
     
-    mmd_sq = np.mean(K_XX) + np.mean(K_YY) - 2 * np.mean(K_XY)
+    mmd_sq = mean_k_xx + mean_k_yy - 2 * mean_k_xy
     
     # Return sqrt(MMD^2) -> MMD
     # Numerical noise can make mmd_sq slightly negative
-    mmd_value = np.sqrt(np.maximum(mmd_sq, 0))
+    # mmd_value = np.sqrt(np.maximum(mmd_sq, 0))
+    mmd_value = np.maximum(mmd_sq, 0)
     
     return mmd_value
 
